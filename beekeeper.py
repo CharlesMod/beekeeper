@@ -197,11 +197,19 @@ class Beekeeper:
     # ---------- tools ----------
     def _inside(self, p):
         rp = os.path.realpath(p if os.path.isabs(p) else os.path.join(self.arena, p))
-        return rp if rp == self.arena or rp.startswith(self.arena + os.sep) else None
+        if rp == self.arena or rp.startswith(self.arena + os.sep):
+            return rp, None
+        # small models echo their location imperfectly; a unique basename match is graced, with a note
+        base = os.path.basename(rp)
+        hits = [os.path.join(r, base) for r, _, fs in os.walk(self.arena) if base in fs]
+        if len(hits) == 1:
+            rel = os.path.relpath(hits[0], self.arena)
+            return hits[0], f"[path corrected to {rel} — the path you gave pointed outside the arena] "
+        return None, None
 
     def t_read(self, file_path):
-        p = self._inside(file_path)
-        if not p: return fail('blocked', f"{file_path} is outside the arena")
+        p, note = self._inside(file_path)
+        if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         try: body = open(p, errors='replace').read()
         except OSError as e: return fail('args', str(e))
         sha = hashlib.sha1(body.encode()).hexdigest()
@@ -225,8 +233,8 @@ class Beekeeper:
             return fail('parse', f"edit produced a syntax error (line {e.lineno}: {e.msg}) — rolled back")
 
     def t_edit(self, file_path, old_str, new_str):
-        p = self._inside(file_path)
-        if not p: return fail('blocked', f"{file_path} is outside the arena")
+        p, note = self._inside(file_path)
+        if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         try: s = open(p).read()
         except OSError as e: return fail('args', str(e))
         n = s.count(old_str)
@@ -243,11 +251,11 @@ class Beekeeper:
             return ("OK: replaced 1 occurrence. NOTE: this edit changed only numeric literals. "
                     "If you are tuning a constant to satisfy a test, that is the wrong fix — "
                     "find the wrong OPERATION (sign, comparison, name) instead.")
-        return "OK: replaced 1 occurrence"
+        return (note or '') + "OK: replaced 1 occurrence"
 
     def t_write(self, file_path, content):
-        p = self._inside(file_path)
-        if not p: return fail('blocked', f"{file_path} is outside the arena")
+        p, note = self._inside(file_path)
+        if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         if os.path.exists(p):
             old = open(p, errors='replace').read()
             if old.count('\n') >= 40 and len(content) < len(old) * 0.5:
@@ -262,7 +270,7 @@ class Beekeeper:
             if err: return err
         self.read_cache.pop(p, None)
         self.ledger.append(f"write {os.path.basename(p)} ({len(content)} chars)")
-        return f"OK: wrote {len(content)} chars"
+        return (note or '') + f"OK: wrote {len(content)} chars"
 
     def t_bash(self, command):
         sig = norm_sig(command)

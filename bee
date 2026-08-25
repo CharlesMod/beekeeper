@@ -10,7 +10,6 @@
 #   bee -t 600 "task"                 time cap (default 900s)
 SRC=$0; while [ -L "$SRC" ]; do SRC=$(readlink "$SRC"); done
 ROOT=$(cd "$(dirname "$SRC")" && pwd)
-[ -f "$HOME/.beekeeper/config" ] && { set -a; . "$HOME/.beekeeper/config"; set +a; }
 case $1 in
   setup) shift; exec python3 "$ROOT/hatch.py" "$@";;
   serve) [ -x "$HOME/.beekeeper/serve.sh" ] || { echo "bee: no local server configured — run: bee setup" >&2; exit 2; }
