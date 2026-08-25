@@ -30,7 +30,14 @@ architecture, and RAM, then downloads an honest tier:
 |---|---|---|---|
 | ≥ 12 GB | Ling-3.0-tiny IQ4_XS (8B MoE) | 4.4 GiB | the reference setup |
 | 8–12 GB | same, tight-RAM profile | 4.4 GiB | close heavy apps while it works |
-| < 8 GB | LFM2.5-2.6B Q4_K_M | 1.7 GiB | best-in-class tool calling at this size |
+| < 8 GB | LFM2.5-2.6B Q4_K_M | 1.7 GiB | clean tool calling; suits small, single-step tasks |
+
+Honesty note, from our own benchmark: the < 8 GB tier runs the harness
+mechanics flawlessly (verified end-to-end), but on a multi-step repair
+benchmark it diagnoses without ever committing to an edit. Treat it as a
+capable runner of small, concrete tasks — "rename this", "add a flag",
+"summarize these logs" — not an autonomous repair agent. For that, use the
+≥ 12 GB tier or point `bee` at an API model (Lane 1).
 
 ```sh
 bee setup                # llama.cpp release binary + tiered model

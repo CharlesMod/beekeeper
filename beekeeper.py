@@ -135,8 +135,11 @@ class Beekeeper:
         self.compact_at = int(budget * 0.55) * 4      # chars
         self.hard_limit = int(budget * 0.80) * 4
         self.max_tokens = 700
+        self.tok_floor = 700                 # raised to 2048 when a thinking model is detected
         self.exhaustions = 0
         self.read_cache = {}
+        self.read_msgs = {}                  # message idx -> path, so eviction can un-cache reads
+        self.last_full_read = None
         self.ledger = []
         self.sig_history = []            # (norm_sig, ok) trail for loop pivot
         self.poison = {}                 # norm_sig -> crash count
@@ -213,9 +216,11 @@ class Beekeeper:
         try: body = open(p, errors='replace').read()
         except OSError as e: return fail('args', str(e))
         sha = hashlib.sha1(body.encode()).hexdigest()
+        self.last_full_read = None
         if self.read_cache.get(p) == sha:
             return "[unchanged since your last read — you already have this file in context]"
         self.read_cache[p] = sha
+        self.last_full_read = p
         lines = body.splitlines()
         if len(body) > 9000:
             shown = lines[:150] + [f"... [{len(lines) - 190} lines omitted — use edit for targeted changes] ..."] + lines[-40:]
@@ -232,13 +237,43 @@ class Beekeeper:
             open(p, 'wb').write(before)
             return fail('parse', f"edit produced a syntax error (line {e.lineno}: {e.msg}) — rolled back")
 
+    def _edit_grace(self, s, old_str, new_str):
+        """Small models paraphrase whitespace and copy the N| display prefixes from read
+        output. If the content still identifies a unique block, grace the edit with a note."""
+        o = re.sub(r'(?m)^\s*\d+\|', '', old_str)
+        w = re.sub(r'(?m)^\s*\d+\|', '', new_str)
+        if o != old_str and s.count(o) == 1:
+            return o, w, "[line-number prefixes stripped — the N| in read output is display, not file content] "
+        flines, olines = s.split('\n'), o.split('\n')
+        tgt = [l.strip() for l in olines]
+        if not any(tgt): return None, None, None
+        hits = [i for i in range(len(flines) - len(olines) + 1)
+                if [l.strip() for l in flines[i:i + len(olines)]] == tgt]
+        if len(hits) != 1: return None, None, None
+        i = hits[0]
+        exact = '\n'.join(flines[i:i + len(olines)])
+        if s.count(exact) != 1: return None, None, None
+        shift = (len(flines[i]) - len(flines[i].lstrip())) - (len(olines[0]) - len(olines[0].lstrip()))
+        nlines = w.split('\n')
+        if shift > 0:
+            nlines = [(' ' * shift + l if l.strip() else l) for l in nlines]
+        elif shift < 0:
+            nlines = [l[min(-shift, len(l) - len(l.lstrip())):] if l.strip() else l for l in nlines]
+        return exact, '\n'.join(nlines), "[old_str matched by content with corrected whitespace] "
+
     def t_edit(self, file_path, old_str, new_str):
         p, note = self._inside(file_path)
         if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         try: s = open(p).read()
         except OSError as e: return fail('args', str(e))
         n = s.count(old_str)
-        if n == 0: return fail('args', "old_str not found (check exact whitespace)")
+        if n == 0:
+            g_old, g_new, g_note = self._edit_grace(s, old_str, new_str)
+            if g_old is not None:
+                old_str, new_str, note = g_old, g_new, (note or '') + g_note
+                n = s.count(old_str)
+        if n == 0: return fail('args', "old_str not found — copy the exact lines from a fresh read, "
+                                       "without the N| line-number prefixes")
         if n > 1: return fail('args', f"old_str occurs {n} times; add context to make it unique")
         before = s.encode()
         open(p, 'w').write(s.replace(old_str, new_str))
@@ -320,7 +355,8 @@ class Beekeeper:
 
     # ---------- context discipline ----------
     def _size(self):
-        return sum(len(str(m.get('content') or '')) + 200 for m in self.messages)
+        return sum(len(str(m.get('content') or '')) + len(str(m.get('tool_calls') or '')) + 200
+                   for m in self.messages)
 
     def compact(self, hard=False):
         keep = 4 if hard else 8
@@ -333,11 +369,18 @@ class Beekeeper:
             if m.get('role') == 'tool' and len(str(m.get('content') or '')) > 200:
                 m['content'] = "(evicted to fit context — re-run the tool if needed)"
                 dropped += 1
+                # evicting a read result means the model no longer has that file:
+                # un-cache it so the re-run this notice asks for actually serves content
+                if i in self.read_msgs:
+                    self.read_cache.pop(self.read_msgs.pop(i), None)
+        if dropped:
+            self.last_result, self.repeat_run = (None, None), 0
         ledger = '\n'.join(self.ledger[-30:]) or '(none yet)'
         self.messages.insert(2, {"role": "user", "content":
             f"[context compacted: {dropped} old tool results elided. Action ledger:\n{ledger}\n"
             f"Do not re-read unchanged files.]"})
         self.pin_idx = {i + 1 if i >= 2 else i for i in self.pin_idx}
+        self.read_msgs = {i + 1 if i >= 2 else i: p for i, p in self.read_msgs.items()}
         log(f"[beekeeper] compacted ({'hard' if hard else 'soft'}): {dropped} results elided")
 
     def _pin_red(self, idx, content):
@@ -398,14 +441,22 @@ class Beekeeper:
                 calls = good
                 self.max_tokens = min(2048, self.max_tokens + 512)
                 if not calls:
-                    if self.exhaustions >= 3: self.compact(hard=True); self.exhaustions = 0
+                    if self.exhaustions >= 3:
+                        # compact only under real context pressure — repeated output
+                        # truncation with a small context is starvation, not fullness
+                        if self._size() > self.compact_at: self.compact(hard=True)
+                        self.exhaustions = 0
                     self.messages.append({"role": "user", "content":
                         "(your output hit the token limit before any complete tool call — "
                         "budget raised; keep thinking brief and go straight to the call)"})
                     continue
             else:
                 self.exhaustions = 0
-                self.max_tokens = max(700, self.max_tokens - 100)
+                self.max_tokens = max(self.tok_floor, self.max_tokens - 100)
+            if msg.get('reasoning_content') and self.tok_floor < 2048:
+                self.tok_floor = 2048
+                self.max_tokens = max(self.max_tokens, 2048)
+                log("[beekeeper] thinking model detected — token floor raised to 2048")
             if not calls and text:
                 calls = salvage_tool_calls(text)
                 if calls: log(f"[beekeeper t{turn}] salvaged {len(calls)} tool call(s) from prose")
@@ -453,6 +504,8 @@ class Beekeeper:
                 idx = len(self.messages)
                 self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
                 self._pin_red(idx, str(result))
+                if name == 'read' and self.last_full_read:
+                    self.read_msgs[idx] = self.last_full_read
                 # the harness moves the model (eiDOS): forced pivot on a closed path
                 ok = not str(result).startswith('ERROR')
                 self.sig_history.append((sig, ok))
