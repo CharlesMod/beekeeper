@@ -143,6 +143,7 @@ class Beekeeper:
         self.ledger = []
         self.sig_history = []            # (norm_sig, ok) trail for loop pivot
         self.poison = {}                 # norm_sig -> crash count
+        self.override_pending = set()    # (path, old_str, new_str) numeric-gate refusals awaiting re-issue
         self.last_result = (None, None)  # (sig, sha) for collapse-with-count
         self.repeat_run = 0
         self.pin_idx = set()             # message indices compaction must never evict
@@ -284,6 +285,18 @@ class Beekeeper:
         if n == 0: return fail('args', "old_str not found — copy the exact lines from a fresh read, "
                                        "without the N| line-number prefixes")
         if n > 1: return fail('args', f"old_str occurs {n} times; add context to make it unique")
+        # anti-Goodhart gate: an edit that ONLY changes numbers is usually tuning, not fixing.
+        # Refused once; re-issuing the identical edit applies it (constants ARE sometimes wrong).
+        numeric_only = old_str != new_str and re.sub(r'[\d.]+', '#', old_str) == re.sub(r'[\d.]+', '#', new_str)
+        override_key = (p, old_str, new_str)
+        if numeric_only and override_key not in self.override_pending:
+            self.override_pending.add(override_key)
+            return fail('blocked', "this edit changes ONLY numeric literals. Retuning a constant to "
+                                   "satisfy a test is the wrong fix — find the wrong OPERATION "
+                                   "(sign, comparison, name), not the constant. If the constant itself "
+                                   "is genuinely wrong, re-issue this exact edit now to override this "
+                                   "gate — a deliberate, named act, on the record.")
+        self.override_pending.discard(override_key)
         before = s.encode()
         prev_mtime = os.stat(p).st_mtime
         open(p, 'w').write(s.replace(old_str, new_str))
@@ -291,12 +304,12 @@ class Beekeeper:
         if err: return err
         self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
-        self.ledger.append(f"edit {os.path.basename(p)}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}")
-        # anti-Goodhart tripwire: an edit that ONLY changes numbers is usually tuning, not fixing
-        if re.sub(r'[\d.]+', '#', old_str) == re.sub(r'[\d.]+', '#', new_str) and old_str != new_str:
-            return ("OK: replaced 1 occurrence. NOTE: this edit changed only numeric literals. "
-                    "If you are tuning a constant to satisfy a test, that is the wrong fix — "
-                    "find the wrong OPERATION (sign, comparison, name) instead.")
+        tag = " [numeric-only, applied on override]" if numeric_only else ""
+        self.ledger.append(f"edit {os.path.basename(p)}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}{tag}")
+        if numeric_only:
+            return ("OK: replaced 1 occurrence. NOTE: this edit changed only numeric literals and was "
+                    "applied on your override. If you are tuning a constant to satisfy a test, that is "
+                    "the wrong fix — find the wrong OPERATION (sign, comparison, name) instead.")
         return (note or '') + "OK: replaced 1 occurrence"
 
     def t_write(self, file_path, content):

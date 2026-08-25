@@ -65,6 +65,11 @@ lying about it, `2` = backend unreachable.
 - The harness moves the model (forced pivots after repeated identical failures).
 - The model never settles its own claims (verify gate + tamper monitor).
 - The system never lies to the model (every refusal names the real rule).
+- Advisory text does not deter; only blocking gates do. An edit that changes
+  only numeric literals is refused once — retuning a constant to pass a test
+  is the cheat every scaffold converges on. Because constants are sometimes
+  genuinely wrong, re-issuing the identical edit overrides the gate: a
+  deliberate, named act, on the record.
 - The advertised context window is a promise; beekeeper serves only what the
   hardware actually delivers.
 
