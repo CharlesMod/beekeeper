@@ -1,0 +1,32 @@
+#!/bin/sh
+# bee — hand beekeeper a task. Verification is ON by default (auto-detected).
+#   bee setup [--api|--mlx|--small]   get a brain (cloud key or local model)
+#   bee serve                         start the local model server
+#   bee board                         start the waggle task board (:8484)
+#   bee "fix the failing tests"       task in the current directory
+#   bee "task" ~/proj/thing           task in a named directory
+#   bee -v "make check" "task"        override the verify command
+#   bee -n "task"                     UNGATED: no verification of done
+#   bee -t 600 "task"                 time cap (default 900s)
+SRC=$0; while [ -L "$SRC" ]; do SRC=$(readlink "$SRC"); done
+ROOT=$(cd "$(dirname "$SRC")" && pwd)
+[ -f "$HOME/.beekeeper/config" ] && { set -a; . "$HOME/.beekeeper/config"; set +a; }
+case $1 in
+  setup) shift; exec python3 "$ROOT/hatch.py" "$@";;
+  serve) [ -x "$HOME/.beekeeper/serve.sh" ] || { echo "bee: no local server configured — run: bee setup" >&2; exit 2; }
+         exec "$HOME/.beekeeper/serve.sh";;
+  board) exec python3 "$ROOT/waggle.py";;
+esac
+VERIFY="" ; CAP=900 ; NOV=""
+while getopts "v:t:nh" o; do case $o in
+  v) VERIFY="$OPTARG";; t) CAP="$OPTARG";; n) NOV=1;;
+  h) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+esac; done
+shift $((OPTIND-1))
+[ -z "$1" ] && { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+TASK=$1; ARENA=${2:-$PWD}
+[ -d "$ARENA" ] || { echo "bee: no such directory: $ARENA" >&2; exit 2; }
+set -- python3 "$ROOT/beekeeper.py" --arena "$ARENA" --prompt "$TASK" --max-seconds "$CAP"
+[ -n "$NOV" ] && set -- "$@" --no-verify
+[ -n "$VERIFY" ] && set -- "$@" --verify "$VERIFY"
+exec "$@"
