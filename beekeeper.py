@@ -11,7 +11,7 @@ Doctrine: the harness moves the model; the model never settles its own claims;
 the system never lies to the model; a refusal names the real rule.
 """
 import argparse, hashlib, json, os, re, signal, subprocess, sys, time
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse
 
 def _cfg():
     out = {}
@@ -27,6 +27,10 @@ def _opt(env, key, default):
 DEF_BASE = _opt('BEEKEEPER_BASE_URL', 'BEEKEEPER_BASE_URL', 'http://127.0.0.1:8008/v1')
 DEF_MODEL = _opt('BEEKEEPER_MODEL', 'BEEKEEPER_MODEL', 'local')
 API_KEY = _opt('BEEKEEPER_API_KEY', 'BEEKEEPER_API_KEY', '')
+# The hive's research organ: a SearXNG-compatible metasearch endpoint.
+# Unset means the tool is never offered — the system never advertises a
+# capability it does not have.
+SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
@@ -57,6 +61,24 @@ TOOLS = [
     {"type": "function", "function": {"name": "done", "description": "Finish. Gated: refuses if verification fails or protected files were tampered with.",
      "parameters": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}}},
 ]
+TOOLS.append(
+    {"type": "function", "function": {"name": "fetch",
+     "description": "Download a URL into the arena. Follows redirects and "
+                    "reports what actually arrived (type and size) — use this "
+                    "instead of curl for downloads.",
+     "parameters": {"type": "object", "properties": {
+         "url": {"type": "string"},
+         "save_as": {"type": "string", "description": "filename in the arena"}},
+         "required": ["url", "save_as"]}}})
+if SEARCH_URL:
+    TOOLS.append(
+        {"type": "function", "function": {"name": "search",
+         "description": "Search the web. Returns ranked title/url/snippet. "
+                        "Use this instead of guessing URLs — guessed links 404.",
+         "parameters": {"type": "object", "properties": {
+             "query": {"type": "string"},
+             "limit": {"type": "integer", "description": "max results (default 6)"}},
+             "required": ["query"]}}})
 REGISTRY = {t['function']['name'] for t in TOOLS}
 
 def log(msg): print(msg, flush=True)
@@ -360,6 +382,66 @@ class Beekeeper:
         self.ledger.append(f"bash: {command[:60]} -> exit {p.returncode}")
         return f"exit {p.returncode}\n{out}"
 
+    def t_fetch(self, url, save_as):
+        """Research needs hands: a leaf that can pull a file down stops
+        fighting curl flags. Reports what ARRIVED, not what was asked
+        for — an HTML error page saved as .mp3 is the classic silent
+        failure, so it is named instead."""
+        p, note = self._inside(save_as)
+        if not p:
+            p = os.path.join(self.arena, os.path.basename(str(save_as)))
+        if not str(url).lower().startswith(('http://', 'https://')):
+            return fail('args', "url must be http(s)")
+        try:
+            req = urllib.request.Request(str(url), headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; beekeeper/1.0)'})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                ctype = (r.headers.get('Content-Type') or '').split(';')[0].strip()
+                size = 0
+                h = hashlib.sha1()
+                with open(p, 'wb') as out:
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk: break
+                        out.write(chunk); size += len(chunk); h.update(chunk)
+        except urllib.error.HTTPError as e:
+            return fail('network', f"HTTP {e.code} — that URL is not there; search for a real one")
+        except Exception as e:
+            return fail('network', f"{type(e).__name__}: {str(e)[:120]}")
+        self.read_cache.pop(p, None)
+        rel = os.path.relpath(p, self.arena)
+        if size < 1024 or ctype.startswith(('text/html', 'application/xhtml')):
+            head = open(p, 'rb').read(200)
+            os.unlink(p)
+            return fail('network',
+                        f"that URL returned {ctype or 'unknown'} ({size} bytes), not a file — "
+                        f"it looks like a web page, not the asset. Starts: {head[:80]!r}")
+        self.ledger.append(f"fetch {rel} ({size} bytes, {ctype})")
+        return f"OK: saved {rel} — {size} bytes, content-type {ctype or 'unknown'}"
+
+    def t_search(self, query, limit=6):
+        """Research is a first-class capability, not a prompt paragraph:
+        a leaf that can search stops guessing URLs and starts finding
+        them (hive service, keeper direction 2026-08-25)."""
+        if not SEARCH_URL:
+            return fail('blocked', "this bench has no search service configured")
+        url = (SEARCH_URL.rstrip('/') + '/search?format=json&q='
+               + urllib.parse.quote(str(query)))
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'beekeeper/1.0'})
+            data = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        except Exception as e:
+            return fail('network', f"search failed: {type(e).__name__}: {str(e)[:120]}")
+        try:
+            n = max(1, min(12, int(limit)))
+        except (TypeError, ValueError):
+            n = 6
+        lines = []
+        for i, r in enumerate(data.get('results', [])[:n], 1):
+            snippet = re.sub(r'\s+', ' ', str(r.get('content') or ''))[:180]
+            lines.append(f"{i}. {r.get('title','')}\n   {r.get('url','')}\n   {snippet}")
+        return '\n'.join(lines) or "(no results — try different terms)"
+
     def _run_verify(self):
         try:
             r = subprocess.run(self.verify_cmd, shell=True, cwd=self.arena, capture_output=True,
@@ -520,10 +602,17 @@ class Beekeeper:
                 # collapse-with-count (eiDOS): repetition rendered AS repetition
                 sig = norm_sig(f"{name} {brief}")
                 rsha = hashlib.sha1(str(result).encode()).hexdigest()
+                repeated = False
                 if (sig, rsha) == self.last_result:
                     self.repeat_run += 1
                     result = (f"[identical to your previous result — {self.repeat_run + 1}x in a row. "
                               f"You already have this. Stop repeating and move on.]")
+                    # A command that exits 0 while changing nothing is a
+                    # stall the exit code cannot see: the sig_history pivot
+                    # only fires on failures, so an idle success can loop
+                    # forever. Repetition itself is the signal.
+                    if self.repeat_run + 1 >= 3:
+                        repeated = True
                 else:
                     self.last_result, self.repeat_run = (sig, rsha), 0
                 log(f"[beekeeper t{turn}]   -> {str(result)[:140]}")
@@ -535,6 +624,15 @@ class Beekeeper:
                 # the harness moves the model (eiDOS): forced pivot on a closed path
                 ok = not str(result).startswith('ERROR')
                 self.sig_history.append((sig, ok))
+                if repeated:
+                    self.messages.append({"role": "user", "content":
+                        "[pivot required: that action has produced the identical "
+                        "result 3x. Repeating it cannot help, whatever it returned. "
+                        "Change METHOD entirely — a different tool is usually the "
+                        "answer; check the tools you have not tried yet.]"})
+                    self.last_result, self.repeat_run = (None, None), 0
+                    self.sig_history.clear()
+                    continue
                 tail = self.sig_history[-3:]
                 if len(tail) == 3 and len({s for s, _ in tail}) == 1 and not any(o for _, o in tail):
                     self.messages.append({"role": "user", "content":
