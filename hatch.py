@@ -103,6 +103,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--api', action='store_true'); ap.add_argument('--mlx', action='store_true')
     ap.add_argument('--small', action='store_true'); ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true', help='with --dry-run: emit the plan as JSON (for orchestrators)')
     ap.add_argument('--ram', type=float, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.api:
@@ -114,6 +115,11 @@ def main():
     tier_key = pick_tier(ram, a.small)
     t = TIERS[tier_key]
     apple = platform.system() == 'Darwin' and platform.machine() == 'arm64'
+    if a.dry_run and a.json:
+        print(json.dumps({"tier": tier_key, "name": t['name'], "model": t['file'].removesuffix('.gguf'),
+                          "file": t['file'], "size_gb": t['size_gb'], "ctx": t['ctx'], "port": PORT,
+                          "ram_gb": round(ram, 1), "os": platform.system(), "arch": platform.machine()}))
+        return
     print(f"system: {platform.system()} {platform.machine()} · {ram:.0f} GB RAM -> tier: {t['name']}")
     if tier_key == 'ling8':
         print("  note: workable but tight — close heavy apps while the bee works; --small is the safe fallback")
