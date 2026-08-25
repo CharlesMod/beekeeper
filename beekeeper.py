@@ -228,6 +228,15 @@ class Beekeeper:
             shown = [f"{i+1}|{l}" for i, l in enumerate(lines)]
         return '\n'.join(shown)
 
+    @staticmethod
+    def _freshen(p, prev_mtime):
+        """A rewrite that keeps byte size and lands in the same second leaves
+        Python's __pycache__ trusting stale bytecode — verify would then test
+        the OLD code and lie red (or green). Nudge mtime past the record."""
+        st = os.stat(p)
+        if int(st.st_mtime) <= int(prev_mtime):
+            os.utime(p, (st.st_atime, int(prev_mtime) + 1))
+
     def _syntax_guard(self, p, before):
         if not p.endswith('.py'): return None
         try:
@@ -276,9 +285,11 @@ class Beekeeper:
                                        "without the N| line-number prefixes")
         if n > 1: return fail('args', f"old_str occurs {n} times; add context to make it unique")
         before = s.encode()
+        prev_mtime = os.stat(p).st_mtime
         open(p, 'w').write(s.replace(old_str, new_str))
         err = self._syntax_guard(p, before)
         if err: return err
+        self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
         self.ledger.append(f"edit {os.path.basename(p)}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}")
         # anti-Goodhart tripwire: an edit that ONLY changes numbers is usually tuning, not fixing
@@ -297,12 +308,14 @@ class Beekeeper:
                 return fail('blocked', "refusing whole-file write that shrinks a large file by >50% — "
                                        "the model tends to emit only the fragment it reasoned about; use edit")
             before = old.encode()
+            prev_mtime = os.stat(p).st_mtime
         else:
-            before = None
+            before, prev_mtime = None, None
         open(p, 'w').write(content)
         if before is not None:
             err = self._syntax_guard(p, before)
             if err: return err
+            self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
         self.ledger.append(f"write {os.path.basename(p)} ({len(content)} chars)")
         return (note or '') + f"OK: wrote {len(content)} chars"
