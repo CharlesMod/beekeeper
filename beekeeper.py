@@ -145,6 +145,26 @@ def salvage_tool_calls(text):
                 out.append({'id': f'salv_{len(out)}', 'type': 'function',
                             'function': {'name': m.group(1), 'arguments': json.dumps(args)}})
             except ValueError: pass
+    # OpenAI-shaped tool call emitted as content: {"name": T, "arguments": {...}}.
+    # Weak tool-callers (7B-class) write the call instead of tagging it; the
+    # hive's episode.py recovers this same shape (do not let a real call read
+    # as prose). Only fires when the anchored forms above found nothing.
+    if not out:
+        for m in re.finditer(r'\{', text):
+            blob = balanced_json(text, m.start())
+            if not blob:
+                continue
+            try:
+                o = json.loads(blob)
+            except ValueError:
+                continue
+            name = o.get('name') if isinstance(o, dict) else None
+            if name in REGISTRY and isinstance(o.get('arguments'), (dict, str)):
+                args = o['arguments']
+                out.append({'id': f'salv_{len(out)}', 'type': 'function',
+                            'function': {'name': name,
+                                         'arguments': args if isinstance(args, str)
+                                         else json.dumps(args)}})
     return out
 
 class Beekeeper:
