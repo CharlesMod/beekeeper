@@ -217,6 +217,14 @@ class Beekeeper:
         self.temperature = float(os.environ.get('BEEKEEPER_TEMPERATURE') or 0)
         self.temperature_source = 'env' if os.environ.get('BEEKEEPER_TEMPERATURE') else 'default'
         self.bash_timeout = int(os.environ.get('BEEKEEPER_BASH_TIMEOUT') or 180)
+        # H-09, the regression net at done: the visible tests are named; the
+        # tests that decide are their siblings in the same files (pool v2's
+        # iceberg: three named cases greened, four siblings left red, done).
+        self.net_policy = os.environ.get('BEEKEEPER_NET', '').strip().lower() or 'on'
+        self.net_source = 'env' if os.environ.get('BEEKEEPER_NET', '').strip() else 'default'
+        self.net_cmd = self._net_cmd(verify_cmd) if (verify_cmd and self.net_policy != 'off') else None
+        self.net_baseline = None           # names failing in those files before the first edit
+        self.net_override = False          # a second done accepts pre-existing siblings
         self.bash_timeout_source = 'env' if os.environ.get('BEEKEEPER_BASH_TIMEOUT') else 'default'
         self.turn = 0
         self.last_verify_red = False     # the most recent verify came back red
@@ -268,7 +276,7 @@ class Beekeeper:
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -433,6 +441,7 @@ class Beekeeper:
                                    "is genuinely wrong, re-issue this exact edit now to override this "
                                    "gate — a deliberate, named act, on the record.")
         self.override_pending.discard(override_key)
+        self._net_baseline()
         before = s.encode()
         prev_mtime = os.stat(p).st_mtime
         open(p, 'w').write(s.replace(old_str, new_str))
@@ -449,6 +458,7 @@ class Beekeeper:
         return (note or '') + "OK: replaced 1 occurrence"
 
     def t_write(self, file_path, content):
+        self._net_baseline()
         p, note = self._inside(file_path)
         if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         if os.path.exists(p):
@@ -556,6 +566,49 @@ class Beekeeper:
             lines.append(f"{i}. {r.get('title','')}\n   {r.get('url','')}\n   {snippet}")
         return '\n'.join(lines) or "(no results — try different terms)"
 
+    _TEST_ID = re.compile(r"""(['"]?)([\w./-]+\.py)::([^\s'"]+)\1""")
+
+    @classmethod
+    def _net_cmd(cls, verify_cmd):
+        """The verify over the FILES the named tests live in, one entry per
+        file; None when the command names no tests."""
+        seen = []
+        def sub(m):
+            f = m.group(2)
+            if f in seen:
+                return ''
+            seen.append(f)
+            return f
+        out = cls._TEST_ID.sub(sub, verify_cmd)
+        if not seen:
+            return None
+        return re.sub(r'[ \t]{2,}', ' ', out).strip()
+
+    @staticmethod
+    def failing_tests(output):
+        """Names pytest reports as FAILED or ERROR in its short summary."""
+        return set(re.findall(r'^(?:FAILED|ERROR) (\S+\.py::\S+?)(?: - .*)?$', output or '', re.M))
+
+    def _run_cmd(self, cmd):
+        try:
+            r = subprocess.run(cmd, shell=True, cwd=self.arena, capture_output=True, text=True,
+                               errors='replace', timeout=self.bash_timeout)
+            return r.returncode, (r.stdout or '') + (r.stderr or '')
+        except subprocess.TimeoutExpired:
+            return 124, f"(net timed out at {self.bash_timeout}s)"
+
+    def _net_baseline(self):
+        """Measured once, before the first edit or write: which tests in the
+        named tests' files fail as the tree stands. Never assumed."""
+        if self.net_cmd is None or self.net_baseline is not None:
+            return
+        code, out = self._run_cmd(self.net_cmd)
+        self.net_baseline = self.failing_tests(out)
+        log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
+            + (": " + ", ".join(sorted(self.net_baseline))[:300] if self.net_baseline else ""))
+        self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
+                     "names": sorted(self.net_baseline)[:40]})
+
     def _run_verify(self):
         try:
             r = subprocess.run(self.verify_cmd, shell=True, cwd=self.arena, capture_output=True,
@@ -573,6 +626,25 @@ class Beekeeper:
             code, out = self._run_verify()
             if code != 0:
                 return fail('blocked', f"done refused — verify exited {code}. The work is not done:\n{out}")
+        if self.net_cmd:
+            self._net_baseline()
+            ncode, nout = self._run_cmd(self.net_cmd)
+            now = self.failing_tests(nout)
+            regressions = sorted(now - (self.net_baseline or set()))
+            siblings = sorted(now & (self.net_baseline or set()))
+            self._spend({"kind": "net", "stage": "done", "failing": len(now), "regressions": regressions[:40],
+                         "siblings": siblings[:40], "override": self.net_override})
+            if regressions:
+                return fail('blocked', "done refused — regression: tests in the files your tests live in "
+                                       f"passed before your edits and fail now: {', '.join(regressions)[:400]}\n"
+                                       f"{nout[-1200:]}")
+            if siblings and not self.net_override:
+                self.net_override = True
+                return fail('blocked', "done refused ONCE — the named tests pass, but tests in the same files "
+                                       f"still fail ({len(siblings)}): {', '.join(siblings)[:400]}. They failed "
+                                       "before you started, so they may be part of this issue. Fix them if "
+                                       "they are yours; re-issue done to accept them as pre-existing.\n"
+                                       f"{nout[-1200:]}")
         return None  # signals acceptance
 
     # ---------- context discipline ----------
