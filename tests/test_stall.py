@@ -156,15 +156,36 @@ def test_refusals_do_not_grow_the_context_either(arena):
     assert len([m for m in bk.messages if m.get("role") == "tool"]) == 1
 
 
-def test_an_exhausted_tool_leaves_the_schema_for_the_next_turn(arena):
-    """After exhaustion the next request must not even offer the tool that
-    looped; every other tool, done included, stays. One turn later it is back."""
+READ = ("read", {"file_path": "f.py"})
+
+
+def test_an_exhausted_tool_leaves_the_schema_until_something_else_executes(arena):
+    """After exhaustion the request must not even offer the tool that looped;
+    every other tool, done included, stays. It comes back once a different
+    action has actually EXECUTED (not merely once a turn has passed — the
+    anyio run on arm D alternated two exhausted actions, each withheld one
+    turn, and stalled on five refusals across the pair)."""
     bk = Scripted(arena, [A, A, A])
     bk.run()
     names = [t["function"]["name"] for t in bk.tools()]
     assert "bash" not in names and {"read", "edit", "write", "done"} <= set(names), names
-    bk.request()                     # one turn consumed
-    assert "bash" in [t["function"]["name"] for t in bk.tools()]
+    bk.request()                     # a turn passes: still withheld
+    assert "bash" not in [t["function"]["name"] for t in bk.tools()]
+    bk2 = Scripted(arena, [A, A, A, READ])
+    bk2.run()                        # a read executed after the exhaustion
+    assert "bash" in [t["function"]["name"] for t in bk2.tools()]
+
+
+def test_withholding_accumulates_across_two_exhausted_actions(arena):
+    """Two exhausted actions alternating must leave NEITHER tool in the
+    schema: the model is left with edit/write/done, which is the point."""
+    # a first read serves the file; only later reads say "unchanged", so
+    # exhausting a read takes four calls (full, unchanged, 2x, 3x)
+    bk = Scripted(arena, [READ, READ, READ, READ, A, A, A, READ, A])
+    bk.run()
+    names = [t["function"]["name"] for t in bk.tools()]
+    assert "bash" not in names and "read" not in names, names
+    assert {"edit", "write", "done"} <= set(names)
 
 
 def test_a_different_tool_is_not_restricted(arena):

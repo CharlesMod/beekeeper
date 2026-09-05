@@ -197,7 +197,7 @@ class Beekeeper:
         self.last_result_text = ''       # its real content (the first, un-collapsed result)
         self.exhausted_idx = {}          # norm_sig -> surviving tool message index
         self.refused_count = {}          # norm_sig -> refusals so far
-        self.restrict = None             # a tool name withheld from the NEXT turn's schema
+        self.withheld = set()            # tool names withheld from the schema until some action EXECUTES
         self.pin_idx = set()             # message indices compaction must never evict
         anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
                     f"Use relative paths; never leave it.]\n\n{task}")
@@ -554,14 +554,17 @@ class Beekeeper:
     # ---------- model ----------
     def tools(self):
         """The schema the next turn sees. After an action is exhausted, the
-        tool that looped is withheld for ONE turn — an affordance removed,
-        not a note appended (the ctx128k-stall arm, 2026-09-04: told
-        'refused, take a different action', the model re-issued the
-        identical read five times). done always stays. Consumed on build."""
-        withheld, self.restrict = self.restrict, None
-        if not withheld or withheld == 'done':
+        tool that looped is withheld — an affordance removed, not a note
+        appended (the ctx128k-stall arm, 2026-09-04: told 'refused, take a
+        different action', the model re-issued the identical read five
+        times) — and every further refusal withholds its tool too, until
+        some action actually executes (arm D: two exhausted actions
+        alternating, each withheld one turn, stalled across the pair).
+        done always stays."""
+        withheld = self.withheld - {'done'}
+        if not withheld:
             return TOOLS
-        return [t for t in TOOLS if t["function"]["name"] != withheld]
+        return [t for t in TOOLS if t["function"]["name"] not in withheld]
 
     def request(self):
         tools = self.tools()
@@ -696,7 +699,7 @@ class Beekeeper:
                             f"action: edit a file, read a different file, or run a different command.]").strip()
                     else:
                         self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
-                    self.restrict = name
+                    self.withheld.add(name)
                     if self.stall_refusals >= STALL_LIMIT:
                         log(f"[beekeeper] stalled: {self.stall_refusals} consecutive refused repeats; ending")
                         return 3
@@ -709,6 +712,7 @@ class Beekeeper:
                 except Exception as e:
                     result = fail('exec', f"{type(e).__name__}: {e}")
                 self.stall_refusals = 0
+                self.withheld.clear()            # something executed: the schema is whole again
                 changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
                 if changed_world and self.exhausted:
                     self.exhausted.clear()   # the world changed; a re-probe is new information
@@ -732,7 +736,7 @@ class Beekeeper:
                         repeated = True
                         self.exhausted[sig] = n
                         self.exhausted_idx[sig] = self.last_result_idx
-                        self.restrict = name
+                        self.withheld.add(name)
                     if single and self.last_result_idx is not None and self.last_result_idx < len(self.messages):
                         # collapse: the repeat leaves the context, the first
                         # copy carries the count — repetition in the context
