@@ -176,6 +176,8 @@ class Beekeeper:
         budget = self._load_budget()
         self.compact_at = int(budget * 0.55) * 4      # chars
         self.hard_limit = int(budget * 0.80) * 4
+        log(f"[beekeeper] context budget {budget} tokens ({self.budget_source}); "
+            f"compact at {self.compact_at} chars, hard at {self.hard_limit}")
         self.max_tokens = 700
         self.tok_floor = 700                 # raised to 2048 when a thinking model is detected
         self.exhaustions = 0
@@ -235,10 +237,34 @@ class Beekeeper:
 
     # ---------- budget ----------
     def _load_budget(self):
+        """The context budget, measured before assumed. Resolution order: the
+        operator's word (BEEKEEPER_CONTEXT_TOKENS — a bench pins it), the
+        machine's standing config (~/.beekeeper.json), the server's own
+        /props (llama.cpp reports the per-slot n_ctx), then the old default.
+        The 09-03 public ring assumed 24,000 while the server offered
+        131,072: compaction fired every turn at a tenth of the room, evicted
+        the working file, un-cached it, reset the repeat counter and told the
+        model to re-run the tool — sixty identical reads. Sets budget_source."""
+        v = os.environ.get('BEEKEEPER_CONTEXT_TOKENS', '').strip()
+        if v.isdigit() and int(v) > 0:
+            self.budget_source = 'env'; return int(v)
         try:
-            return int(json.load(open(os.path.expanduser('~/.beekeeper.json')))['context_budget_tokens'])
+            n = int(json.load(open(os.path.expanduser('~/.beekeeper.json')))['context_budget_tokens'])
+            if n > 0:
+                self.budget_source = 'file'; return n
         except Exception:
-            return 24000
+            pass
+        try:
+            root = self.url[:-len('/v1/chat/completions')]
+            req = urllib.request.Request(root + '/props', headers={'User-Agent': 'beekeeper/1.0'})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                props = json.loads(r.read())
+            n = int((props.get('default_generation_settings') or {}).get('n_ctx') or props.get('n_ctx') or 0)
+            if n > 0:
+                self.budget_source = 'server'; return n
+        except Exception:
+            pass
+        self.budget_source = 'default'; return 24000
 
     # ---------- tools ----------
     def _inside(self, p):
