@@ -244,7 +244,10 @@ class Beekeeper:
         d = os.environ.get('BEEKEEPER_SPEND_DIR', '').strip()
         if d:
             os.makedirs(d, exist_ok=True)
-            self.spend_path = os.path.join(d, f"{int(time.time())}-{os.getpid()}.jsonl")
+            # unique per run: inside a container every worker is PID 1 and four
+            # start in the same second (pool v2: 25 ledgers for 28 runs)
+            self.spend_path = os.path.join(d, f"{int(time.time())}-{os.getpid()}-"
+                                              f"{hashlib.sha1(self.arena.encode()).hexdigest()[:8]}.jsonl")
         self.spend_turn = {}                 # the record being assembled this turn
         self.last_think = (0, 0, None)       # (budget, used, closed) of the latest thinking turn
         self.compactions = 0
@@ -629,6 +632,7 @@ class Beekeeper:
     def _spend(self, rec):
         if not self.spend_path:
             return
+        rec = dict(rec, arena=self.arena)      # every record attributable on its own
         with open(self.spend_path, 'a', encoding='utf-8') as fh:
             fh.write(json.dumps(rec, separators=(',', ':')) + "\n")
 

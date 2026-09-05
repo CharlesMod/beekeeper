@@ -92,3 +92,24 @@ def test_nothing_is_written_without_the_dir(arena, tmp_path, monkeypatch):
     Scripted(arena, [EDIT]).run()
     assert not (tmp_path / "spend").exists()
     assert not list(tmp_path.glob("**/*.jsonl"))
+
+
+def test_ledger_names_are_unique_per_arena_and_records_carry_the_arena(tmp_path, monkeypatch):
+    """Inside a container the worker is PID 1 and four workers start in the
+    same second: a name of time+pid collided (pool v2: 25 ledgers for 28 runs,
+    turn records unattributable). The name carries the arena's hash and every
+    record carries the arena."""
+    monkeypatch.setenv("BEEKEEPER_CONTEXT_TOKENS", "24000")
+    monkeypatch.setenv("BEEKEEPER_SPEND_DIR", str(tmp_path / "spend"))
+    a1, a2 = tmp_path / "a1", tmp_path / "a2"
+    a1.mkdir(); a2.mkdir()
+    b1, b2 = Scripted(a1, [EDIT]), Scripted(a2, [EDIT])
+    assert b1.spend_path != b2.spend_path
+    (a1 / "f.py").write_text("greeting = 'hello'\n"); (a2 / "f.py").write_text("greeting = 'hello'\n")
+    b1.run(); b2.run()
+    files = list((tmp_path / "spend").glob("*.jsonl"))
+    assert len(files) == 2
+    for f in files:
+        recs = [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+        assert all("arena" in r for r in recs), recs[0]
+        assert len({r["arena"] for r in recs}) == 1
