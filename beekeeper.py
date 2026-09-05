@@ -642,6 +642,11 @@ class Beekeeper:
                     self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": refusal})
                     continue
                 sig = norm_sig(f"{name} {brief}")
+                if name in ('edit', 'write'):
+                    # an edit's identity is its content, not its path: two
+                    # different edits to one file are a search, not a loop
+                    sig += "@" + hashlib.sha1(json.dumps(
+                        [args.get('old_str'), args.get('new_str'), args.get('content')]).encode()).hexdigest()[:10]
                 # The stall law: an action that has returned the identical
                 # result 3x is EXHAUSTED — refused before it runs, until an
                 # edit or write changes the world. A note does not move a
@@ -671,12 +676,17 @@ class Beekeeper:
                 except Exception as e:
                     result = fail('exec', f"{type(e).__name__}: {e}")
                 self.stall_refusals = 0
-                if name in ('edit', 'write') and not str(result).startswith('ERROR') and self.exhausted:
+                changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
+                if changed_world and self.exhausted:
                     self.exhausted.clear()   # the world changed; a re-probe is new information
-                # collapse-with-count (eiDOS): repetition rendered AS repetition
+                # collapse-with-count (eiDOS): repetition rendered AS repetition —
+                # never of a successful edit or write: progress is exempt even
+                # when its confirmation text repeats
                 rsha = hashlib.sha1(str(result).encode()).hexdigest()
                 repeated = False
-                if (sig, rsha) == self.last_result:
+                if changed_world:
+                    self.last_result, self.repeat_run = (sig, rsha), 0
+                elif (sig, rsha) == self.last_result:
                     self.repeat_run += 1
                     result = (f"[identical to your previous result — {self.repeat_run + 1}x in a row. "
                               f"You already have this. Stop repeating and move on.]")
