@@ -225,6 +225,17 @@ class Beekeeper:
         self.current_budget = 0
         self.max_seconds = None
         self.t0 = time.time()
+        # The spend ledger (budget-law.md §7): one JSONL record per turn and one
+        # at the end, beside the transcripts (BEEKEEPER_SPEND_DIR), never in the
+        # arena. Every parameter of the budget law is chosen from it.
+        self.spend_path = None
+        d = os.environ.get('BEEKEEPER_SPEND_DIR', '').strip()
+        if d:
+            os.makedirs(d, exist_ok=True)
+            self.spend_path = os.path.join(d, f"{int(time.time())}-{os.getpid()}.jsonl")
+        self.spend_turn = {}                 # the record being assembled this turn
+        self.last_think = (0, 0, None)       # (budget, used, closed) of the latest thinking turn
+        self.compactions = 0
         self.pin_idx = set()             # message indices compaction must never evict
         anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
                     f"Use relative paths; never leave it.]\n\n{task}")
@@ -548,6 +559,7 @@ class Beekeeper:
                    for m in self.messages)
 
     def compact(self, hard=False):
+        self.compactions += 1
         keep = 4 if hard else 8
         n = len(self.messages)
         evictable = [i for i in range(2, n - keep) if i not in self.pin_idx]
@@ -592,6 +604,29 @@ class Beekeeper:
         if not withheld:
             return TOOLS
         return [t for t in TOOLS if t["function"]["name"] not in withheld]
+
+    def _spend(self, rec):
+        if not self.spend_path:
+            return
+        with open(self.spend_path, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(rec, separators=(',', ':')) + "\n")
+
+    def phase(self):
+        if self.turn == 1:
+            return 'turn_one'
+        if self.after_verify:
+            return 'after_red_verify' if self.last_verify_red else 'after_green_verify'
+        return 'plain'
+
+    @staticmethod
+    def failing_count(output):
+        """pytest's summary, if any: 'N failed' → N; a green summary → 0; else None."""
+        m = re.search(r'(\d+) failed', output or '')
+        if m:
+            return int(m.group(1))
+        if re.search(r'\d+ passed', output or '') or str(output).startswith('exit 0'):
+            return 0
+        return None
 
     def think_now(self):
         """The per-turn rung: None when no policy is set (say nothing), else
@@ -656,6 +691,7 @@ class Beekeeper:
             self.think_next = (max(self.think_base, self.current_budget // 2)
                                if used < self.current_budget / 2 else self.current_budget)
         log(f"[beekeeper t{turn}] think used={used} closed={closed}")
+        self.last_think = (self.current_budget, used, closed)
         return overflow, rc
 
     def request(self):
@@ -686,15 +722,33 @@ class Beekeeper:
                 log(f"[beekeeper] stream died ({str(e)[:100]}) — resurrecting")
         return None
 
+    def _end(self, reason, rc):
+        if self.spend_turn:
+            self._spend(self.spend_turn); self.spend_turn = {}
+        self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
+                     "t": round(time.time() - self.t0, 2), "arena": self.arena,
+                     "compactions": self.compactions, "model": self.model,
+                     "think_policy": self.think_policy})
+        return rc
+
     def run(self, max_seconds=None):
         t0 = time.time()
         self.t0, self.max_seconds = t0, max_seconds
         nudges = 0
         for turn in range(1, MAX_TURNS + 1):
             if max_seconds and time.time() - t0 > max_seconds:
-                log(f"[beekeeper] soft cap {max_seconds}s reached"); return 1
+                log(f"[beekeeper] soft cap {max_seconds}s reached"); return self._end("time budget", 1)
+            if self.spend_turn:
+                self._spend(self.spend_turn)
             self.turn = turn
             think = self.think_now()
+            self.last_think = (0, 0, None)
+            self.spend_turn = {"kind": "turn", "turn": turn, "t": round(time.time() - t0, 2),
+                               "phase": self.phase(), "think": bool(think) if think is not None else None,
+                               "budget": self.think_budget() if think else 0, "used": 0, "closed": None,
+                               "action": None, "sig": None, "refused": False, "verify": None,
+                               "failing": None, "ctx_chars": self._size(), "compactions": self.compactions,
+                               "max_tokens": None, "tok_rate": round(self.tok_rate, 1)}
             if think is not None:
                 self.think_log.append((turn, bool(think)))
                 log(f"[beekeeper t{turn}] think={'on' if think else 'off'}"
@@ -703,7 +757,7 @@ class Beekeeper:
             elif self._size() > self.compact_at: self.compact()
             t_req = time.time()
             choice = self.request()
-            if choice is None: return 2
+            if choice is None: return self._end("model unreachable", 2)
             if think:
                 overflow, partial = self._account_think(choice, time.time() - t_req, turn)
                 if overflow:
@@ -715,7 +769,10 @@ class Beekeeper:
                         choice = self.request()
                     finally:
                         self.force_no_think = False
-                    if choice is None: return 2
+                    if choice is None: return self._end("model unreachable", 2)
+            self.spend_turn.update({"budget": self.last_think[0] or self.spend_turn["budget"],
+                                    "used": self.last_think[1], "closed": self.last_think[2],
+                                    "max_tokens": self.current_budget + self.ANSWER_ROOM if think else self.max_tokens})
             msg, finish = choice.get('message', {}), choice.get('finish_reason')
             calls = msg.get('tool_calls') or []
             text = (msg.get('content') or '').strip()
@@ -751,7 +808,7 @@ class Beekeeper:
             if text: log(f"[beekeeper t{turn}] {text[:250]}")
             if not calls:
                 nudges += 1
-                if nudges > NUDGE_LIMIT: log("[beekeeper] model stopped acting; ending"); return 1
+                if nudges > NUDGE_LIMIT: log("[beekeeper] model stopped acting; ending"); return self._end("model stopped acting", 1)
                 self.messages.append({"role": "assistant", "content": text[:400]})
                 self.messages.append({"role": "user", "content":
                     "Reply with a tool call, not prose. Use done only when the submission is written."})
@@ -769,7 +826,7 @@ class Beekeeper:
                     refusal = self.t_done(**args)
                     if refusal is None:
                         log(f"[beekeeper] DONE (verified): {args.get('summary', '')[:200]}")
-                        return 0
+                        return self._end("capped", 0)
                     log(f"[beekeeper t{turn}]   -> {refusal[:200]}")
                     self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": refusal})
                     continue
@@ -787,8 +844,10 @@ class Beekeeper:
                 # notes in view, the same probe re-issued in a period-3 cycle
                 # because this guard used to reset its own counter at 3).
                 # The refusal is an affordance change, and it is remembered.
+                self.spend_turn.update({"action": name, "sig": sig})
                 if sig in self.exhausted:
                     self.stall_refusals += 1
+                    self.spend_turn["refused"] = True
                     self.refused_count[sig] = self.refused_count.get(sig, 0) + 1
                     result = fail('blocked', f"refused — this exact call has returned the identical "
                                              f"result {self.exhausted[sig]}x and will not run again until "
@@ -813,7 +872,7 @@ class Beekeeper:
                     self.withheld.add(name)
                     if self.stall_refusals >= STALL_LIMIT:
                         log(f"[beekeeper] stalled: {self.stall_refusals} consecutive refused repeats; ending")
-                        return 3
+                        return self._end("stalled", 3)
                     continue
                 fn = getattr(self, f"t_{name}", None)
                 try:
@@ -830,6 +889,8 @@ class Beekeeper:
                 self.after_verify = is_verify
                 if is_verify:
                     self.last_verify_red = not str(result).startswith('exit 0')
+                    self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
+                    self.spend_turn["failing"] = self.failing_count(str(result))
                     if not self.last_verify_red:
                         self.edits_since_green = 0
                 changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
@@ -908,7 +969,7 @@ class Beekeeper:
                         "Do NOT run it again — change METHOD entirely: different tool, different file, "
                         "or re-diagnose from the failing output above.]"})
                     self.sig_history.clear()
-        log("[beekeeper] turn limit reached"); return 1
+        log("[beekeeper] turn limit reached"); return self._end("turn budget", 1)
 
 def main():
     ap = argparse.ArgumentParser()
