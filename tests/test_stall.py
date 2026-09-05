@@ -159,33 +159,32 @@ def test_refusals_do_not_grow_the_context_either(arena):
 READ = ("read", {"file_path": "f.py"})
 
 
-def test_an_exhausted_tool_leaves_the_schema_until_something_else_executes(arena):
-    """After exhaustion the request must not even offer the tool that looped;
-    every other tool, done included, stays. It comes back once a different
-    action has actually EXECUTED (not merely once a turn has passed — the
-    anyio run on arm D alternated two exhausted actions, each withheld one
-    turn, and stalled on five refusals across the pair)."""
+def test_default_withhold_is_one_turn_the_keeper_carries_d(arena):
+    """The keeper carried arm D (2026-09-05): after exhaustion the tool that
+    looped leaves the NEXT turn's schema and is back the turn after. Arm E's
+    accumulating withhold (every refusal withholds its tool until something
+    executes) stays available as BEEKEEPER_WITHHOLD=until-execute; the
+    default is declared in the settings line, never silent."""
     bk = Scripted(arena, [A, A, A])
     bk.run()
+    assert bk.withhold_policy == "turn"
     names = [t["function"]["name"] for t in bk.tools()]
     assert "bash" not in names and {"read", "edit", "write", "done"} <= set(names), names
-    bk.request()                     # a turn passes: still withheld
-    assert "bash" not in [t["function"]["name"] for t in bk.tools()]
+    assert "bash" in [t["function"]["name"] for t in bk.tools()], "one turn later it is back"
+
+
+def test_withholding_accumulates_under_until_execute(arena, monkeypatch):
+    """Arm E's semantics on request: two exhausted actions alternating leave
+    NEITHER tool in the schema until some action executes."""
+    monkeypatch.setenv("BEEKEEPER_WITHHOLD", "until-execute")
+    bk = Scripted(arena, [READ, READ, READ, READ, A, A, A, READ, A])
+    bk.run()
+    assert bk.withhold_policy == "until-execute"
+    names = [t["function"]["name"] for t in bk.tools()]
+    assert "bash" not in names and "read" not in names, names
     bk2 = Scripted(arena, [A, A, A, READ])
     bk2.run()                        # a read executed after the exhaustion
     assert "bash" in [t["function"]["name"] for t in bk2.tools()]
-
-
-def test_withholding_accumulates_across_two_exhausted_actions(arena):
-    """Two exhausted actions alternating must leave NEITHER tool in the
-    schema: the model is left with edit/write/done, which is the point."""
-    # a first read serves the file; only later reads say "unchanged", so
-    # exhausting a read takes four calls (full, unchanged, 2x, 3x)
-    bk = Scripted(arena, [READ, READ, READ, READ, A, A, A, READ, A])
-    bk.run()
-    names = [t["function"]["name"] for t in bk.tools()]
-    assert "bash" not in names and "read" not in names, names
-    assert {"edit", "write", "done"} <= set(names)
 
 
 def test_a_different_tool_is_not_restricted(arena):

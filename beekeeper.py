@@ -202,7 +202,11 @@ class Beekeeper:
         self.last_result_text = ''       # its real content (the first, un-collapsed result)
         self.exhausted_idx = {}          # norm_sig -> surviving tool message index
         self.refused_count = {}          # norm_sig -> refusals so far
-        self.withheld = set()            # tool names withheld from the schema until some action EXECUTES
+        self.withheld = set()            # tool names withheld from the schema
+        # BEEKEEPER_WITHHOLD = turn (arm D, the keeper's carry 2026-09-05: withheld for
+        # the NEXT turn only) | until-execute (arm E: until some action executes)
+        self.withhold_policy = os.environ.get('BEEKEEPER_WITHHOLD', '').strip().lower() or 'turn'
+        self.withhold_source = 'env' if os.environ.get('BEEKEEPER_WITHHOLD', '').strip() else 'default'
         # Two rungs of one model: BEEKEEPER_THINK = unset (say nothing) | off | on |
         # phase (think on turn 1 and after a red verify; never after an edit or a
         # green verify). The choice is logged per turn — measured, not asserted.
@@ -260,7 +264,8 @@ class Beekeeper:
         log(f"[beekeeper] settings: budget={budget}({self.budget_source}) think={self.think_policy}({self.think_source}) "
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
-            f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) max_turns={MAX_TURNS} "
+            f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
+            f"withhold={self.withhold_policy}({self.withhold_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -615,6 +620,8 @@ class Beekeeper:
         alternating, each withheld one turn, stalled across the pair).
         done always stays."""
         withheld = self.withheld - {'done'}
+        if self.withhold_policy == 'turn':
+            self.withheld = set()        # consumed by this build: one turn only (arm D)
         if not withheld:
             return TOOLS
         return [t for t in TOOLS if t["function"]["name"] not in withheld]
