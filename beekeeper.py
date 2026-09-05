@@ -10,7 +10,7 @@ Third-generation harness, bred from three of its author's systems:
 Doctrine: the harness moves the model; the model never settles its own claims;
 the system never lies to the model; a refusal names the real rule.
 """
-import argparse, hashlib, json, os, re, signal, subprocess, sys, time
+import argparse, hashlib, json, os, re, signal, statistics, subprocess, sys, time
 import urllib.request, urllib.error, urllib.parse
 
 def _cfg():
@@ -34,6 +34,8 @@ SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
+RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
+RESTART_FLOOR_S = 60  # never restart into less than this many seconds
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
 THINK_CEILING = 4096  # BEEKEEPER_THINK_CEILING: never ask for more thinking than this in one turn
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
@@ -173,7 +175,8 @@ def salvage_tool_calls(text):
 class Beekeeper:
     ANSWER_ROOM = 700                    # tokens left for the tool call after a think block closes
 
-    def __init__(self, arena, task, verify_cmd=None, base_url=DEF_BASE, model=DEF_MODEL):
+    def __init__(self, arena, task, verify_cmd=None, base_url=DEF_BASE, model=DEF_MODEL,
+                 start_verify=True, net_baseline=None):
         self.arena = os.path.realpath(arena)
         self.url = base_url.rstrip('/').removesuffix('/chat/completions').removesuffix('/v1') + '/v1/chat/completions'
         self.model = model
@@ -223,6 +226,9 @@ class Beekeeper:
         self.net_policy = os.environ.get('BEEKEEPER_NET', '').strip().lower() or 'on'
         self.net_source = 'env' if os.environ.get('BEEKEEPER_NET', '').strip() else 'default'
         self.net_cmd = self._net_cmd(verify_cmd) if (verify_cmd and self.net_policy != 'off') else None
+        self.restart_policy = os.environ.get('BEEKEEPER_RESTART', '').strip().lower() or 'off'
+        self.restart_source = 'env' if os.environ.get('BEEKEEPER_RESTART', '').strip() else 'default'
+        self.end_reason = None
         self.net_baseline = None           # names failing in those files before the first edit
         self.net_override = False          # a second done accepts pre-existing siblings
         self.bash_timeout_source = 'env' if os.environ.get('BEEKEEPER_BASH_TIMEOUT') else 'default'
@@ -268,7 +274,9 @@ class Beekeeper:
         self.snapshot = self._tree_hash()
         self.protected = self._protected_set()
         self.assert_base = self._assert_count()
-        if verify_cmd:
+        if net_baseline is not None:
+            self.net_baseline = set(net_baseline)   # a restart carries the baseline measured before the FIRST edit
+        if verify_cmd and start_verify:
             code, _ = self._run_verify()
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
@@ -276,7 +284,7 @@ class Beekeeper:
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -289,6 +297,11 @@ class Beekeeper:
                 try: out[os.path.relpath(p, self.arena)] = hashlib.sha1(open(p, 'rb').read()).hexdigest()
                 except OSError: pass
         return out
+
+    def _changed_files(self):
+        """Files whose bytes differ from the start-of-episode snapshot."""
+        now = self._tree_hash()
+        return {p for p in set(now) | set(self.snapshot) if now.get(p) != self.snapshot.get(p)}
 
     def _protected_set(self):
         pats = ('test_', 'conftest', 'check_')
@@ -819,6 +832,7 @@ class Beekeeper:
         return None
 
     def _end(self, reason, rc):
+        self.end_reason = reason
         if self.spend_turn:
             self._spend(self.spend_turn); self.spend_turn = {}
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
@@ -1067,6 +1081,55 @@ class Beekeeper:
                     self.sig_history.clear()
         log("[beekeeper] turn limit reached"); return self._end("turn budget", 1)
 
+def _may_restart(left, walls, floor=RESTART_FLOOR_S):
+    """H-12: another episode starts only while the clock holds a median
+    episode and at least the floor. No clock: the count is the only limit."""
+    if left is None:
+        return True
+    need = max(float(floor), statistics.median(walls) if walls else 0.0)
+    return left >= need
+
+
+def run_attempts(make, max_seconds=None, limit=RESTART_LIMIT):
+    """H-12, restart on stall. `make(attempt, notes, prev)` builds a worker
+    over the same tree: the task text plus one note per earlier attempt.
+    An episode that ends stalled (exit 3) restarts as a FRESH context — the
+    proxy pins the sampler, so the context is the only thing a restart can
+    vary — while the clock still holds a median episode. The restart skips
+    the start verify and carries the net's baseline (`prev`). Returns the
+    last attempt's exit code and the attempt records."""
+    t0 = time.time()
+    attempts, notes, prev = [], [], None
+    for attempt in range(1, limit + 1):
+        left = None if max_seconds is None else max(0.0, max_seconds - (time.time() - t0))
+        bk = make(attempt, notes, prev)
+        bk.attempt = attempt
+        t_a = time.time()
+        rc = bk.run(max_seconds=left)
+        wall = time.time() - t_a
+        sigs = sorted(bk.exhausted)[:4]
+        edited = sorted(bk._changed_files())[:6]
+        rec = {"attempt": attempt, "rc": rc, "reason": bk.end_reason, "turns": bk.turn,
+               "wall": round(wall, 2), "sigs": sigs, "edited": edited}
+        attempts.append(rec)
+        if rc != 3 or bk.restart_policy != 'on':
+            break
+        left = None if max_seconds is None else max(0.0, max_seconds - (time.time() - t0))
+        ok = _may_restart(left, [a["wall"] for a in attempts]) and attempt < limit
+        bk._spend({"kind": "restart", "attempt": attempt, "reason": bk.end_reason, "turns": bk.turn,
+                   "wall": round(wall, 2), "left": None if left is None else round(left, 1),
+                   "restarting": bool(ok), "sigs": sigs, "edited": edited})
+        if not ok:
+            log(f"[beekeeper] stalled with {left if left is None else round(left)}s left — no time for another episode")
+            break
+        notes.append(f"[Attempt {attempt} stalled after {bk.turn} turns and {wall:.0f}s: it kept repeating "
+                     f"{', '.join(sigs) or 'the same call'}. The tree carries its edits "
+                     f"({', '.join(edited) or 'none'}). Do not repeat those calls; take a different approach.]")
+        log(f"[beekeeper] restart {attempt + 1}: fresh context over the same tree, {round(left) if left is not None else 'no'}s left")
+        prev = bk
+    return attempts[-1]["rc"], attempts
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--arena', required=True)
@@ -1080,8 +1143,13 @@ def main():
     verify = None if a.no_verify else (a.verify or auto_verify(os.path.realpath(a.arena)))
     log(f"[beekeeper] verify gate: {verify}" if verify else
         "[beekeeper] UNGATED — no check detected or --no-verify; done is the model's word")
-    bk = Beekeeper(a.arena, task, verify_cmd=verify, base_url=a.base_url, model=a.model)
-    sys.exit(bk.run(max_seconds=a.max_seconds))
+    def make(attempt, notes, prev):
+        text = task + ("\n\n" + "\n".join(notes) if notes else "")
+        return Beekeeper(a.arena, text, verify_cmd=verify, base_url=a.base_url, model=a.model,
+                         start_verify=(attempt == 1),
+                         net_baseline=(prev.net_baseline if prev is not None else None))
+    rc, _ = run_attempts(make, max_seconds=a.max_seconds)
+    sys.exit(rc)
 
 if __name__ == '__main__':
     main()
