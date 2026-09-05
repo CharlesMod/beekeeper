@@ -5,9 +5,8 @@ the naive arm narrated untagged for 4,096 tokens and never reached a diff;
 with it off, a three-second diff writer. Nobody measured thinking INSIDE
 the loop, on the turns where it might pay (diagnosis) and never on the
 turns where it cannot (an edit, a verify). Laws:
-  - BEEKEEPER_THINK unset: the request body carries no thinking field at
-    all (byte-identical to the worker before this law, so a pinned proxy
-    that forces the setting sees nothing new);
+  - BEEKEEPER_THINK unset: OFF, sent explicitly (amended 09-05: a silent
+    "say nothing" let the server decide under a harness-chosen pin);
   - off / on: every turn asks explicitly for that setting;
   - phase: think on turn 1, think on the turn after a red verify, never on
     the turn after an edit or a green verify; the decision is logged per
@@ -62,11 +61,12 @@ def _thinking(body):
     return (body.get("chat_template_kwargs") or {}).get("enable_thinking", "absent")
 
 
-def test_unset_policy_sends_no_thinking_field(arena):
+def test_unset_policy_is_explicit_off(arena):
+    """Amended 2026-09-05 (silent-defaults.md): saying nothing let the server's
+    default decide under a harness-chosen pin. Unset is OFF, said out loud."""
     bk = Scripted(arena, [EDIT])
     bk.run()
-    assert all(_thinking(b) == "absent" for b in bk.bodies), bk.bodies[0].keys()
-    assert "chat_template_kwargs" not in bk.bodies[0]
+    assert all(_thinking(b) is False for b in bk.bodies), bk.bodies[0].get("chat_template_kwargs")
 
 
 def test_off_and_on_ask_explicitly_every_turn(arena, monkeypatch):

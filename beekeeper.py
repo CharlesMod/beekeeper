@@ -183,6 +183,7 @@ class Beekeeper:
         self.hard_limit = int(budget * 0.80) * 4
         log(f"[beekeeper] context budget {budget} tokens ({self.budget_source}); "
             f"compact at {self.compact_at} chars, hard at {self.hard_limit}")
+        self._settings_pending = (budget,)
         self.max_tokens = 700
         self.tok_floor = 700                 # raised to 2048 when a thinking model is detected
         self.exhaustions = 0
@@ -205,7 +206,14 @@ class Beekeeper:
         # Two rungs of one model: BEEKEEPER_THINK = unset (say nothing) | off | on |
         # phase (think on turn 1 and after a red verify; never after an edit or a
         # green verify). The choice is logged per turn — measured, not asserted.
-        self.think_policy = os.environ.get('BEEKEEPER_THINK', '').strip().lower() or None
+        # unset is OFF, sent explicitly: under a pin that leaves thinking to the
+        # harness, saying nothing would let the server's default decide in silence
+        self.think_policy = os.environ.get('BEEKEEPER_THINK', '').strip().lower() or 'off'
+        self.think_source = 'env' if os.environ.get('BEEKEEPER_THINK', '').strip() else 'default'
+        self.temperature = float(os.environ.get('BEEKEEPER_TEMPERATURE') or 0)
+        self.temperature_source = 'env' if os.environ.get('BEEKEEPER_TEMPERATURE') else 'default'
+        self.bash_timeout = int(os.environ.get('BEEKEEPER_BASH_TIMEOUT') or 180)
+        self.bash_timeout_source = 'env' if os.environ.get('BEEKEEPER_BASH_TIMEOUT') else 'default'
         self.turn = 0
         self.last_verify_red = False     # the most recent verify came back red
         self.after_verify = False        # the previous action was a verify
@@ -249,6 +257,12 @@ class Beekeeper:
             code, _ = self._run_verify()
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
+        log(f"[beekeeper] settings: budget={budget}({self.budget_source}) think={self.think_policy}({self.think_source}) "
+            f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
+            f"temperature={self.temperature:g}({self.temperature_source}) "
+            f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) max_turns={MAX_TURNS} "
+            f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
+            f"max_tokens={self.max_tokens} model={self.model}")
 
     # ---------- tamper monitors (hive quorum) ----------
     def _tree_hash(self):
@@ -457,13 +471,13 @@ class Beekeeper:
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, start_new_session=True)
             try:
-                out, _ = p.communicate(timeout=60)
+                out, _ = p.communicate(timeout=self.bash_timeout)
             except subprocess.TimeoutExpired:
                 try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                 except OSError: p.kill()
                 out, _ = p.communicate()
                 self.poison[sig] = self.poison.get(sig, 0) + 1
-                return fail('timeout', "command timed out at 60s (process tree killed). "
+                return fail('timeout', f"command timed out at {self.bash_timeout}s (process tree killed). "
                                        "Non-interactive commands only; everything must exit on its own.")
         except OSError as e:
             return fail('exec', str(e))
@@ -631,8 +645,6 @@ class Beekeeper:
     def think_now(self):
         """The per-turn rung: None when no policy is set (say nothing), else
         the decision under the policy."""
-        if self.think_policy in (None, ''):
-            return None
         if self.think_policy == 'on':
             return True
         if self.think_policy == 'off':
@@ -662,7 +674,7 @@ class Beekeeper:
         budget = self.think_budget() if think else 0
         self.current_budget = budget
         body = {"model": self.model, "messages": self.messages, "tools": self.tools(),
-                "temperature": 0.2,
+                "temperature": self.temperature,
                 "max_tokens": (self.ANSWER_ROOM + budget) if think else self.max_tokens}
         if think is not None:
             body["chat_template_kwargs"] = {"enable_thinking": bool(think)}
