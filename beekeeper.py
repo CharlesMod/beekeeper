@@ -226,6 +226,13 @@ class Beekeeper:
         self.net_policy = os.environ.get('BEEKEEPER_NET', '').strip().lower() or 'on'
         self.net_source = 'env' if os.environ.get('BEEKEEPER_NET', '').strip() else 'default'
         self.net_cmd = self._net_cmd(verify_cmd) if (verify_cmd and self.net_policy != 'off') else None
+        self.board_policy = os.environ.get('BEEKEEPER_BOARD', '').strip().lower() or 'off'
+        self.board_source = 'env' if os.environ.get('BEEKEEPER_BOARD', '').strip() else 'default'
+        self.board_rows = {}            # test id -> (state, turn): red | green | '?'; flipped by verification alone
+        self.board_flips = []           # (turn, id) each time a row turns green
+        if self.board_policy == 'on' and verify_cmd:
+            for m in self._TEST_ID.finditer(verify_cmd):
+                self.board_rows.setdefault(f"{m.group(3)}::{m.group(4)}", ('?', 0))
         self.restart_policy = os.environ.get('BEEKEEPER_RESTART', '').strip().lower() or 'off'
         self.restart_source = 'env' if os.environ.get('BEEKEEPER_RESTART', '').strip() else 'default'
         self.end_reason = None
@@ -277,14 +284,15 @@ class Beekeeper:
         if net_baseline is not None:
             self.net_baseline = set(net_baseline)   # a restart carries the baseline measured before the FIRST edit
         if verify_cmd and start_verify:
-            code, _ = self._run_verify()
+            code, out0 = self._run_verify()
+            self._observe(code, out0, turn=0)
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
         log(f"[beekeeper] settings: budget={budget}({self.budget_source}) think={self.think_policy}({self.think_source}) "
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -611,6 +619,52 @@ class Beekeeper:
         except subprocess.TimeoutExpired:
             return 124, f"(net timed out at {self.bash_timeout}s)"
 
+    def _observe(self, code, out, turn):
+        """A verify observation flips board rows: exit 0 greens every row;
+        otherwise the ids pytest names as FAILED/ERROR go red and the rest
+        of the named set — which ran and did not fail — go green. A run
+        that could not collect (exit 4/5, "no tests ran") measures nothing."""
+        if not self.board_rows:
+            return
+        text = str(out or '')
+        if code in (4, 5) or 'no tests ran' in text or 'not found:' in text:
+            return
+        failing = self.failing_tests(text) if code != 0 else set()
+        for tid, (state, _) in list(self.board_rows.items()):
+            new = 'red' if tid in failing else 'green'
+            if new == 'green' and state != 'green':
+                self.board_flips.append((turn, tid))
+            self.board_rows[tid] = (new, turn)
+
+    def _render_board(self, turn):
+        """One message, rebuilt in place every turn, pinned: the visible tests
+        as the court last measured them, the clock, and the edits so far."""
+        if not self.board_rows:
+            return
+        mark = {'red': '✗', 'green': '✓', '?': '?'}
+        left = ''
+        if self.max_seconds:
+            left = f" · {max(0, int(self.max_seconds - (time.time() - self.t0)))}s left"
+        edited = sorted(self._changed_files())[:4]
+        head = f"[Board t{turn}{left} · edits {len(edited)}" + (f" ({', '.join(edited)})" if edited else "") + "]"
+        rows = []
+        for tid, (state, seen) in self.board_rows.items():
+            rows.append(f"{mark[state]} {tid} — {state}" + (f" (t{seen})" if seen else " (start)"))
+        shown, rest = rows[:12], rows[12:]
+        body = "\n".join([head] + shown + ([f"… +{len(rest)} more rows"] if rest else []))[:1200]
+        idx = next((i for i, m in enumerate(self.messages)
+                    if m.get('role') == 'user' and str(m.get('content', '')).startswith('[Board')), None)
+        if idx is None:
+            self.messages.insert(2, {"role": "user", "content": body})
+            self.pin_idx = {i + 1 if i >= 2 else i for i in self.pin_idx} | {2}
+            self.read_msgs = {i + 1 if i >= 2 else i: p for i, p in self.read_msgs.items()}
+            if getattr(self, 'last_result_idx', None) is not None and self.last_result_idx >= 2:
+                self.last_result_idx += 1
+            self.exhausted_idx = {k: (v + 1 if v >= 2 else v) for k, v in self.exhausted_idx.items()}
+        else:
+            self.messages[idx]["content"] = body
+            self.pin_idx.add(idx)
+
     def _net_baseline(self):
         """Measured once, before the first edit or write: which tests in the
         named tests' files fail as the tree stands. Never assumed."""
@@ -638,6 +692,7 @@ class Beekeeper:
                                    ". Restore the protected files; the specification is not yours to edit.")
         if self.verify_cmd:
             code, out = self._run_verify()
+            self._observe(code, out, self.turn)
             if code != 0:
                 return fail('blocked', f"done refused — verify exited {code}. The work is not done:\n{out}")
         if self.net_cmd:
@@ -863,6 +918,7 @@ class Beekeeper:
                 self.think_log.append((turn, bool(think)))
                 log(f"[beekeeper t{turn}] think={'on' if think else 'off'}"
                     + (f" budget={self.think_budget()}" if think else ""))
+            if self.board_policy == 'on': self._render_board(turn)
             if self._size() > self.hard_limit: self.compact(hard=True)
             elif self._size() > self.compact_at: self.compact()
             t_req = time.time()
@@ -999,6 +1055,9 @@ class Beekeeper:
                 self.after_verify = is_verify
                 if is_verify:
                     self.last_verify_red = not str(result).startswith('exit 0')
+                    if self.board_rows:
+                        m0 = re.match(r'exit (\\d+)', str(result))
+                        self._observe(int(m0.group(1)) if m0 else (1 if self.last_verify_red else 0), str(result), turn)
                     self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
                     self.spend_turn["failing"] = self.failing_count(str(result))
                     if not self.last_verify_red:
