@@ -34,7 +34,8 @@ SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
-THINK_BUDGET = 512  # thinking tokens a thinking turn may spend before the tool call (server-capped too)
+THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
+THINK_CEILING = 4096  # BEEKEEPER_THINK_CEILING: never ask for more thinking than this in one turn
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
 
 SYSTEM = """You are beekeeper, a terse repair agent. You fix broken machines (code) with the fewest, most causal moves.
@@ -170,6 +171,8 @@ def salvage_tool_calls(text):
     return out
 
 class Beekeeper:
+    ANSWER_ROOM = 700                    # tokens left for the tool call after a think block closes
+
     def __init__(self, arena, task, verify_cmd=None, base_url=DEF_BASE, model=DEF_MODEL):
         self.arena = os.path.realpath(arena)
         self.url = base_url.rstrip('/').removesuffix('/chat/completions').removesuffix('/v1') + '/v1/chat/completions'
@@ -207,6 +210,21 @@ class Beekeeper:
         self.last_verify_red = False     # the most recent verify came back red
         self.after_verify = False        # the previous action was a verify
         self.think_log = []              # (turn, think) per turn
+        # The smarter budget (llama.cpp's --reasoning-budget is server-wide, so the
+        # harness spends it per turn through max_tokens): base x phase, capped by
+        # the ceiling and a quarter of the clock, doubled after an overflow, halved
+        # back toward the base after an early close. An overflow continues the turn
+        # once with thinking off and the partial thought quoted — a thought becomes
+        # an action, never a wasted turn.
+        self.think_base = int(os.environ.get('BEEKEEPER_THINK_BUDGET') or THINK_BUDGET)
+        self.think_ceiling = int(os.environ.get('BEEKEEPER_THINK_CEILING') or THINK_CEILING)
+        self.think_next = self.think_base   # the adaptive term
+        self.tok_rate = 60.0              # tokens/s, refined from measured thinking turns
+        self.edits_since_green = 0
+        self.force_no_think = False       # set for a continuation request
+        self.current_budget = 0
+        self.max_seconds = None
+        self.t0 = time.time()
         self.pin_idx = set()             # message indices compaction must never evict
         anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
                     f"Use relative paths; never leave it.]\n\n{task}")
@@ -587,13 +605,58 @@ class Beekeeper:
         # phase: diagnosis turns only
         return self.turn == 1 or (self.after_verify and self.last_verify_red)
 
+    def think_budget(self):
+        """Tokens of thinking this turn may spend: base x phase (turn one 1x,
+        after a red verify 2x, two edits without a green 4x), never above the
+        adaptive term's suggestion when that is higher, never above the ceiling,
+        never more than a quarter of the remaining clock at the measured rate."""
+        mult = 1
+        if self.after_verify and self.last_verify_red:
+            mult = 2
+        if self.edits_since_green >= 2:
+            mult = 4
+        b = max(self.think_base * mult, self.think_next)
+        b = min(b, self.think_ceiling)
+        if self.max_seconds:
+            left = max(0.0, self.max_seconds - (time.time() - self.t0))
+            b = min(b, int(left * self.tok_rate / 4))
+        return max(0, int(b))
+
     def _request_body(self):
-        think = self.think_now()
+        think = False if self.force_no_think else self.think_now()
+        budget = self.think_budget() if think else 0
+        self.current_budget = budget
         body = {"model": self.model, "messages": self.messages, "tools": self.tools(),
-                "temperature": 0.2, "max_tokens": self.max_tokens + (THINK_BUDGET if think else 0)}
+                "temperature": 0.2,
+                "max_tokens": (self.ANSWER_ROOM + budget) if think else self.max_tokens}
         if think is not None:
             body["chat_template_kwargs"] = {"enable_thinking": bool(think)}
         return body
+
+    def _account_think(self, choice, elapsed, turn):
+        """After a thinking turn: what it spent and how it closed, and the
+        adaptive term for the next one. Returns True when the turn overflowed
+        (cut by the soft budget before any action) and must be continued."""
+        msg = choice.get('message', {}) or {}
+        rc = msg.get('reasoning_content') or ''
+        usage = choice.get('usage') or {}
+        used = int(usage.get('completion_tokens') or len(rc) // 4)
+        if rc and elapsed > 0.5:
+            self.tok_rate = 0.5 * self.tok_rate + 0.5 * (used / elapsed)
+        overflow = (choice.get('finish_reason') == 'length' and not msg.get('tool_calls')
+                    and not (msg.get('content') or '').strip() and bool(rc))
+        if overflow:
+            closed = 'overflow'
+            self.think_next = min(self.think_ceiling, max(self.current_budget, 1) * 2)
+        elif 'budget reached' in rc.lower():
+            closed = 'budget'
+            self.think_next = min(self.think_ceiling, max(self.current_budget, 1) * 2)
+        else:
+            closed = 'self'
+            self.think_next = (max(self.think_base, self.current_budget // 2)
+                               if used < self.current_budget / 2 else self.current_budget)
+        log(f"[beekeeper t{turn}] think used={used} closed={closed}")
+        return overflow, rc
 
     def request(self):
         built = self._request_body()
@@ -625,6 +688,7 @@ class Beekeeper:
 
     def run(self, max_seconds=None):
         t0 = time.time()
+        self.t0, self.max_seconds = t0, max_seconds
         nudges = 0
         for turn in range(1, MAX_TURNS + 1):
             if max_seconds and time.time() - t0 > max_seconds:
@@ -633,11 +697,25 @@ class Beekeeper:
             think = self.think_now()
             if think is not None:
                 self.think_log.append((turn, bool(think)))
-                log(f"[beekeeper t{turn}] think={'on' if think else 'off'}")
+                log(f"[beekeeper t{turn}] think={'on' if think else 'off'}"
+                    + (f" budget={self.think_budget()}" if think else ""))
             if self._size() > self.hard_limit: self.compact(hard=True)
             elif self._size() > self.compact_at: self.compact()
+            t_req = time.time()
             choice = self.request()
             if choice is None: return 2
+            if think:
+                overflow, partial = self._account_think(choice, time.time() - t_req, turn)
+                if overflow:
+                    self.messages.append({"role": "user", "content":
+                        "[thinking budget reached — your reasoning so far:\n"
+                        f"{partial[-1200:]}]\nAct now with a tool call."})
+                    self.force_no_think = True
+                    try:
+                        choice = self.request()
+                    finally:
+                        self.force_no_think = False
+                    if choice is None: return 2
             msg, finish = choice.get('message', {}), choice.get('finish_reason')
             calls = msg.get('tool_calls') or []
             text = (msg.get('content') or '').strip()
@@ -752,7 +830,11 @@ class Beekeeper:
                 self.after_verify = is_verify
                 if is_verify:
                     self.last_verify_red = not str(result).startswith('exit 0')
+                    if not self.last_verify_red:
+                        self.edits_since_green = 0
                 changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
+                if changed_world:
+                    self.edits_since_green += 1
                 if changed_world and self.exhausted:
                     self.exhausted.clear()   # the world changed; a re-probe is new information
                 # collapse-with-count (eiDOS): repetition rendered AS repetition —
