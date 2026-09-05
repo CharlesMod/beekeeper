@@ -130,3 +130,44 @@ def test_failing_edits_are_conflated_only_when_their_content_is_identical(arena,
     out = capsys.readouterr().out
     # the 2nd and 3rd are rendered as repetition, the 4th is refused before it runs
     assert out.count("identical to your previous") == 2 and "refused" in out, out
+
+
+# --- the attractor: repetition in the context is the pattern the model completes ---
+
+def _tool_calls(bk, name):
+    return [m for m in bk.messages if m.get("role") == "assistant"
+            and any(tc["function"]["name"] == name for tc in (m.get("tool_calls") or []))]
+
+
+def test_repeats_are_collapsed_out_of_the_context(arena):
+    """Three identical calls leave ONE call in the context, its result
+    carrying the count — the attractor is removed, not narrated."""
+    bk = Scripted(arena, [A, A, A])
+    bk.run()
+    assert len(_tool_calls(bk, "bash")) == 1, "the repeated call must appear once"
+    tool_msgs = [m for m in bk.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1 and "3x" in tool_msgs[0]["content"], tool_msgs
+
+
+def test_refusals_do_not_grow_the_context_either(arena):
+    bk = Scripted(arena, [A] * 7)     # 3 run, then refused until the stall exit
+    bk.run()
+    assert len(_tool_calls(bk, "bash")) == 1
+    assert len([m for m in bk.messages if m.get("role") == "tool"]) == 1
+
+
+def test_an_exhausted_tool_leaves_the_schema_for_the_next_turn(arena):
+    """After exhaustion the next request must not even offer the tool that
+    looped; every other tool, done included, stays. One turn later it is back."""
+    bk = Scripted(arena, [A, A, A])
+    bk.run()
+    names = [t["function"]["name"] for t in bk.tools()]
+    assert "bash" not in names and {"read", "edit", "write", "done"} <= set(names), names
+    bk.request()                     # one turn consumed
+    assert "bash" in [t["function"]["name"] for t in bk.tools()]
+
+
+def test_a_different_tool_is_not_restricted(arena):
+    bk = Scripted(arena, [A, A, A])
+    bk.run()
+    assert "read" in [t["function"]["name"] for t in bk.tools()]

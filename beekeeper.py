@@ -193,6 +193,11 @@ class Beekeeper:
         self.repeat_run = 0
         self.exhausted = {}              # norm_sig -> identical-result count; refused until an edit/write
         self.stall_refusals = 0          # consecutive refused repeats
+        self.last_result_idx = None      # index of the surviving tool message for last_result
+        self.last_result_text = ''       # its real content (the first, un-collapsed result)
+        self.exhausted_idx = {}          # norm_sig -> surviving tool message index
+        self.refused_count = {}          # norm_sig -> refusals so far
+        self.restrict = None             # a tool name withheld from the NEXT turn's schema
         self.pin_idx = set()             # message indices compaction must never evict
         anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
                     f"Use relative paths; never leave it.]\n\n{task}")
@@ -547,8 +552,20 @@ class Beekeeper:
             self.pin_idx = {i for i in self.pin_idx if i in (0, 1)} | {idx}
 
     # ---------- model ----------
+    def tools(self):
+        """The schema the next turn sees. After an action is exhausted, the
+        tool that looped is withheld for ONE turn — an affordance removed,
+        not a note appended (the ctx128k-stall arm, 2026-09-04: told
+        'refused, take a different action', the model re-issued the
+        identical read five times). done always stays. Consumed on build."""
+        withheld, self.restrict = self.restrict, None
+        if not withheld or withheld == 'done':
+            return TOOLS
+        return [t for t in TOOLS if t["function"]["name"] != withheld]
+
     def request(self):
-        body = lambda: json.dumps({"model": self.model, "messages": self.messages, "tools": TOOLS,
+        tools = self.tools()
+        body = lambda: json.dumps({"model": self.model, "messages": self.messages, "tools": tools,
                                    "temperature": 0.2, "max_tokens": self.max_tokens}).encode()
         for attempt in range(4):
             if attempt: time.sleep((0, 3, 8, 20)[attempt])
@@ -626,6 +643,7 @@ class Beekeeper:
                     "Reply with a tool call, not prose. Use done only when the submission is written."})
                 continue
             self.messages.append({"role": "assistant", "content": text[:400] or None, "tool_calls": calls})
+            single = len(calls) == 1      # collapse only a one-call turn: the pair is the context's tail
             for tc in calls:
                 f = tc.get('function', {})
                 name = f.get('name', '?')
@@ -657,13 +675,28 @@ class Beekeeper:
                 # The refusal is an affordance change, and it is remembered.
                 if sig in self.exhausted:
                     self.stall_refusals += 1
+                    self.refused_count[sig] = self.refused_count.get(sig, 0) + 1
                     result = fail('blocked', f"refused — this exact call has returned the identical "
                                              f"result {self.exhausted[sig]}x and will not run again until "
                                              f"something changes (an edit or write clears it). Take a "
                                              f"different action: edit a file, read a different file, or "
                                              f"run a different command.")
                     log(f"[beekeeper t{turn}]   -> {str(result)[:140]}")
-                    self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
+                    keep = self.exhausted_idx.get(sig)
+                    if single and keep is not None and keep < len(self.messages):
+                        # the attractor is the repetition itself: this call
+                        # does not enter the context — the surviving copy
+                        # carries the count
+                        self.messages.pop()
+                        self.messages[keep]["content"] = (
+                            f"{self.last_result_text if keep == self.last_result_idx else ''}\n\n"
+                            f"[this exact call has been made {self.exhausted[sig]}x with the identical "
+                            f"result and refused {self.refused_count[sig]}x since — it will not run "
+                            f"again until an edit or write changes something. Take a different "
+                            f"action: edit a file, read a different file, or run a different command.]").strip()
+                    else:
+                        self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
+                    self.restrict = name
                     if self.stall_refusals >= STALL_LIMIT:
                         log(f"[beekeeper] stalled: {self.stall_refusals} consecutive refused repeats; ending")
                         return 3
@@ -683,24 +716,50 @@ class Beekeeper:
                 # never of a successful edit or write: progress is exempt even
                 # when its confirmation text repeats
                 rsha = hashlib.sha1(str(result).encode()).hexdigest()
-                repeated = False
+                repeated = collapsed = False
                 if changed_world:
                     self.last_result, self.repeat_run = (sig, rsha), 0
                 elif (sig, rsha) == self.last_result:
                     self.repeat_run += 1
-                    result = (f"[identical to your previous result — {self.repeat_run + 1}x in a row. "
+                    n = self.repeat_run + 1
+                    result = (f"[identical to your previous result — {n}x in a row. "
                               f"You already have this. Stop repeating and move on.]")
                     # A command that exits 0 while changing nothing is a
                     # stall the exit code cannot see: the sig_history pivot
                     # only fires on failures, so an idle success can loop
                     # forever. Repetition itself is the signal.
-                    if self.repeat_run + 1 >= 3:
+                    if n >= 3:
                         repeated = True
-                        self.exhausted[sig] = self.repeat_run + 1
+                        self.exhausted[sig] = n
+                        self.exhausted_idx[sig] = self.last_result_idx
+                        self.restrict = name
+                    if single and self.last_result_idx is not None and self.last_result_idx < len(self.messages):
+                        # collapse: the repeat leaves the context, the first
+                        # copy carries the count — repetition in the context
+                        # is the pattern a greedy model completes
+                        self.messages.pop()
+                        self.messages[self.last_result_idx]["content"] = (
+                            f"{self.last_result_text}\n\n[this exact call has been made {n}x; the result "
+                            f"was identical every time. You already have this. Stop repeating and move on.]")
+                        collapsed = True
                 else:
                     self.last_result, self.repeat_run = (sig, rsha), 0
+                    self.last_result_text = str(result)
                 log(f"[beekeeper t{turn}]   -> {str(result)[:140]}")
+                if collapsed:
+                    self.sig_history.append((sig, not str(self.last_result_text).startswith('ERROR')))
+                    if repeated:
+                        self.messages.append({"role": "user", "content":
+                            "[pivot required: that action has produced the identical "
+                            "result 3x and is now exhausted — it will be refused until an "
+                            "edit or write changes something. Change METHOD entirely — a "
+                            "different tool is usually the answer; check the tools you "
+                            "have not tried yet.]"})
+                        self.sig_history.clear()
+                    continue
                 idx = len(self.messages)
+                if (sig, rsha) == self.last_result and self.repeat_run == 0:
+                    self.last_result_idx = idx
                 self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
                 self._pin_red(idx, str(result))
                 if name == 'read' and self.last_full_read:
