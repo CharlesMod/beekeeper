@@ -33,6 +33,7 @@ API_KEY = _opt('BEEKEEPER_API_KEY', 'BEEKEEPER_API_KEY', '')
 SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
+STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
 
 SYSTEM = """You are beekeeper, a terse repair agent. You fix broken machines (code) with the fewest, most causal moves.
@@ -190,6 +191,8 @@ class Beekeeper:
         self.override_pending = set()    # (path, old_str, new_str) numeric-gate refusals awaiting re-issue
         self.last_result = (None, None)  # (sig, sha) for collapse-with-count
         self.repeat_run = 0
+        self.exhausted = {}              # norm_sig -> identical-result count; refused until an edit/write
+        self.stall_refusals = 0          # consecutive refused repeats
         self.pin_idx = set()             # message indices compaction must never evict
         anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
                     f"Use relative paths; never leave it.]\n\n{task}")
@@ -638,6 +641,28 @@ class Beekeeper:
                     log(f"[beekeeper t{turn}]   -> {refusal[:200]}")
                     self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": refusal})
                     continue
+                sig = norm_sig(f"{name} {brief}")
+                # The stall law: an action that has returned the identical
+                # result 3x is EXHAUSTED — refused before it runs, until an
+                # edit or write changes the world. A note does not move a
+                # greedy model over a near-static context (pub1 + the ctx128k
+                # retest, 2026-09-04: full context intact, 23 "identical Nx"
+                # notes in view, the same probe re-issued in a period-3 cycle
+                # because this guard used to reset its own counter at 3).
+                # The refusal is an affordance change, and it is remembered.
+                if sig in self.exhausted:
+                    self.stall_refusals += 1
+                    result = fail('blocked', f"refused — this exact call has returned the identical "
+                                             f"result {self.exhausted[sig]}x and will not run again until "
+                                             f"something changes (an edit or write clears it). Take a "
+                                             f"different action: edit a file, read a different file, or "
+                                             f"run a different command.")
+                    log(f"[beekeeper t{turn}]   -> {str(result)[:140]}")
+                    self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
+                    if self.stall_refusals >= STALL_LIMIT:
+                        log(f"[beekeeper] stalled: {self.stall_refusals} consecutive refused repeats; ending")
+                        return 3
+                    continue
                 fn = getattr(self, f"t_{name}", None)
                 try:
                     result = fn(**args) if fn else fail('args', f"unknown tool {name}")
@@ -645,8 +670,10 @@ class Beekeeper:
                     result = fail('args', str(e))
                 except Exception as e:
                     result = fail('exec', f"{type(e).__name__}: {e}")
+                self.stall_refusals = 0
+                if name in ('edit', 'write') and not str(result).startswith('ERROR') and self.exhausted:
+                    self.exhausted.clear()   # the world changed; a re-probe is new information
                 # collapse-with-count (eiDOS): repetition rendered AS repetition
-                sig = norm_sig(f"{name} {brief}")
                 rsha = hashlib.sha1(str(result).encode()).hexdigest()
                 repeated = False
                 if (sig, rsha) == self.last_result:
@@ -659,6 +686,7 @@ class Beekeeper:
                     # forever. Repetition itself is the signal.
                     if self.repeat_run + 1 >= 3:
                         repeated = True
+                        self.exhausted[sig] = self.repeat_run + 1
                 else:
                     self.last_result, self.repeat_run = (sig, rsha), 0
                 log(f"[beekeeper t{turn}]   -> {str(result)[:140]}")
@@ -673,11 +701,11 @@ class Beekeeper:
                 if repeated:
                     self.messages.append({"role": "user", "content":
                         "[pivot required: that action has produced the identical "
-                        "result 3x. Repeating it cannot help, whatever it returned. "
-                        "Change METHOD entirely — a different tool is usually the "
-                        "answer; check the tools you have not tried yet.]"})
-                    self.last_result, self.repeat_run = (None, None), 0
-                    self.sig_history.clear()
+                        "result 3x and is now exhausted — it will be refused until an "
+                        "edit or write changes something. Change METHOD entirely — a "
+                        "different tool is usually the answer; check the tools you "
+                        "have not tried yet.]"})
+                    self.sig_history.clear()   # the counter is NOT reset: the streak is remembered
                     continue
                 tail = self.sig_history[-3:]
                 if len(tail) == 3 and len({s for s, _ in tail}) == 1 and not any(o for _, o in tail):
