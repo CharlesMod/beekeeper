@@ -111,3 +111,14 @@ def test_net_off_is_declared_and_skips_the_net(arena, monkeypatch, capsys):
     rc = Scripted(arena, [FIX_X, DONE]).run()
     out = capsys.readouterr().out
     assert rc == 0 and "net=off(env)" in out and "net baseline" not in out
+
+
+def test_an_unquoted_id_followed_by_shell_punctuation_keeps_the_punctuation():
+    """shlex.quote leaves a plain id bare, and the id pattern must stop at the
+    semicolon that ends the pytest command — pool v2's first net run ate it,
+    pytest got `rc=0` as a file argument, and the net was vacuous."""
+    cmd = 'bash -c "cd /testbed && python -m pytest -q tests/a.py::test_x tests/a.py::test_y; rc=\\$?; exit \\$rc"'
+    net = Beekeeper._net_cmd(cmd)
+    assert net == 'bash -c "cd /testbed && python -m pytest -q tests/a.py; rc=\\$?; exit \\$rc"', net
+    cmd2 = "sh -c 'pytest tests/b.py::test_q[1-2]' && echo ok"
+    assert Beekeeper._net_cmd(cmd2) == "sh -c 'pytest tests/b.py' && echo ok"

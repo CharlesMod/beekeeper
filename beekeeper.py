@@ -566,23 +566,24 @@ class Beekeeper:
             lines.append(f"{i}. {r.get('title','')}\n   {r.get('url','')}\n   {snippet}")
         return '\n'.join(lines) or "(no results — try different terms)"
 
-    _TEST_ID = re.compile(r"""(['"]?)([\w./-]+\.py)::([^\s'"]+)\1""")
+    # an id is a file, `::`, a name; the name stops at whitespace, quotes and
+    # shell punctuation (a bare id is followed by the `;` that ends pytest)
+    _TEST_ID = re.compile(r"""(\s*)(['"]?)([\w./-]+\.py)::([^\s'";&|()<>]+)\2""")
 
     @classmethod
     def _net_cmd(cls, verify_cmd):
         """The verify over the FILES the named tests live in, one entry per
-        file; None when the command names no tests."""
+        file (a dropped duplicate takes its leading whitespace with it); None
+        when the command names no tests."""
         seen = []
         def sub(m):
-            f = m.group(2)
+            f = m.group(3)
             if f in seen:
                 return ''
             seen.append(f)
-            return f
+            return m.group(1) + f
         out = cls._TEST_ID.sub(sub, verify_cmd)
-        if not seen:
-            return None
-        return re.sub(r'[ \t]{2,}', ' ', out).strip()
+        return out if seen else None
 
     @staticmethod
     def failing_tests(output):
