@@ -34,6 +34,7 @@ SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
+THINK_BUDGET = 512  # thinking tokens a thinking turn may spend before the tool call (server-capped too)
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
 
 SYSTEM = """You are beekeeper, a terse repair agent. You fix broken machines (code) with the fewest, most causal moves.
@@ -198,6 +199,14 @@ class Beekeeper:
         self.exhausted_idx = {}          # norm_sig -> surviving tool message index
         self.refused_count = {}          # norm_sig -> refusals so far
         self.withheld = set()            # tool names withheld from the schema until some action EXECUTES
+        # Two rungs of one model: BEEKEEPER_THINK = unset (say nothing) | off | on |
+        # phase (think on turn 1 and after a red verify; never after an edit or a
+        # green verify). The choice is logged per turn — measured, not asserted.
+        self.think_policy = os.environ.get('BEEKEEPER_THINK', '').strip().lower() or None
+        self.turn = 0
+        self.last_verify_red = False     # the most recent verify came back red
+        self.after_verify = False        # the previous action was a verify
+        self.think_log = []              # (turn, think) per turn
         self.pin_idx = set()             # message indices compaction must never evict
         anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
                     f"Use relative paths; never leave it.]\n\n{task}")
@@ -566,10 +575,29 @@ class Beekeeper:
             return TOOLS
         return [t for t in TOOLS if t["function"]["name"] not in withheld]
 
+    def think_now(self):
+        """The per-turn rung: None when no policy is set (say nothing), else
+        the decision under the policy."""
+        if self.think_policy in (None, ''):
+            return None
+        if self.think_policy == 'on':
+            return True
+        if self.think_policy == 'off':
+            return False
+        # phase: diagnosis turns only
+        return self.turn == 1 or (self.after_verify and self.last_verify_red)
+
+    def _request_body(self):
+        think = self.think_now()
+        body = {"model": self.model, "messages": self.messages, "tools": self.tools(),
+                "temperature": 0.2, "max_tokens": self.max_tokens + (THINK_BUDGET if think else 0)}
+        if think is not None:
+            body["chat_template_kwargs"] = {"enable_thinking": bool(think)}
+        return body
+
     def request(self):
-        tools = self.tools()
-        body = lambda: json.dumps({"model": self.model, "messages": self.messages, "tools": tools,
-                                   "temperature": 0.2, "max_tokens": self.max_tokens}).encode()
+        built = self._request_body()
+        body = lambda: json.dumps(built).encode()
         for attempt in range(4):
             if attempt: time.sleep((0, 3, 8, 20)[attempt])
             try:
@@ -601,6 +629,11 @@ class Beekeeper:
         for turn in range(1, MAX_TURNS + 1):
             if max_seconds and time.time() - t0 > max_seconds:
                 log(f"[beekeeper] soft cap {max_seconds}s reached"); return 1
+            self.turn = turn
+            think = self.think_now()
+            if think is not None:
+                self.think_log.append((turn, bool(think)))
+                log(f"[beekeeper t{turn}] think={'on' if think else 'off'}")
             if self._size() > self.hard_limit: self.compact(hard=True)
             elif self._size() > self.compact_at: self.compact()
             choice = self.request()
@@ -713,6 +746,12 @@ class Beekeeper:
                     result = fail('exec', f"{type(e).__name__}: {e}")
                 self.stall_refusals = 0
                 self.withheld.clear()            # something executed: the schema is whole again
+                cmd = str(args.get('command') or '')
+                is_verify = name == 'bash' and bool(cmd) and (
+                    (self.verify_cmd and self.verify_cmd.strip() in cmd) or 'pytest' in cmd or 'docker run' in cmd)
+                self.after_verify = is_verify
+                if is_verify:
+                    self.last_verify_red = not str(result).startswith('exit 0')
                 changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
                 if changed_world and self.exhausted:
                     self.exhausted.clear()   # the world changed; a re-probe is new information
