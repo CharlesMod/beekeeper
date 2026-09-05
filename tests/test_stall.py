@@ -108,11 +108,13 @@ def test_a_changing_result_is_never_refused(arena, capsys):
 def test_successful_edits_to_the_same_file_are_never_exhausted(arena, capsys):
     """Progress is exempt: five distinct successful edits to one file share a
     path and a confirmation text, and none of them is a repeat."""
-    edits = [("edit", {"file_path": "f.py", "old_str": f"v{i}", "new_str": f"v{i+1}"}) for i in range(5)]
-    (arena / "f.py").write_text("greeting = 'v0'\n")
+    words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]   # not numeric: the
+    edits = [("edit", {"file_path": "f.py", "old_str": words[i], "new_str": words[i + 1]})
+             for i in range(5)]                                          # constant gate is another law
+    (arena / "f.py").write_text("greeting = 'alpha'\n")
     Scripted(arena, edits).run()
     out = capsys.readouterr().out
-    assert (arena / "f.py").read_text() == "greeting = 'v5'\n"
+    assert (arena / "f.py").read_text() == "greeting = 'foxtrot'\n"
     assert "refused" not in out and "identical to your previous" not in out, out
 
 
@@ -126,4 +128,5 @@ def test_failing_edits_are_conflated_only_when_their_content_is_identical(arena,
     same = [("edit", {"file_path": "f.py", "old_str": "missing", "new_str": "x"})] * 4
     Scripted(arena, same).run()
     out = capsys.readouterr().out
-    assert out.count("old_str not found") == 3 and "refused" in out, out
+    # the 2nd and 3rd are rendered as repetition, the 4th is refused before it runs
+    assert out.count("identical to your previous") == 2 and "refused" in out, out
