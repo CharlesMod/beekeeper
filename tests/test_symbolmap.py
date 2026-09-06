@@ -23,6 +23,7 @@ Laws:
   - a ranged read returns EXACTLY those lines, numbered, and is not blocked
     by the unchanged-since-your-last-read cache: the map is not the file.
 """
+import json
 import os
 import sys
 
@@ -247,3 +248,56 @@ def test_a_bad_range_is_an_argument_error(arena, monkeypatch):
     bk = Beekeeper(str(arena), "t")
     assert bk.t_read("big.py", start_line=90, end_line=10).startswith("ERROR[args]")
     assert bk.t_read("big.py", start_line=10 ** 7, end_line=10 ** 7 + 5).startswith("ERROR[args]")
+
+
+# ---------- H-51 / M-04: the counts reach the end record ----------
+
+class Scripted(Beekeeper):
+    def __init__(self, arena, task, script, **kw):
+        super().__init__(str(arena), task, **kw)
+        self.script = list(script)
+
+    def request(self):
+        self._request_body()
+        if not self.script:
+            return {"message": {"content": ""}, "finish_reason": "stop"}
+        name, args = self.script.pop(0)
+        return {"message": {"content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}]},
+            "finish_reason": "tool_calls"}
+
+
+def _ends(tmp_path):
+    recs = [json.loads(l) for f in sorted((tmp_path / "spend").glob("*.jsonl"))
+            for l in f.read_text().splitlines() if l.strip()]
+    return [r for r in recs if r.get("kind") == "end"]
+
+
+MAP_KEYS = {"big_reads", "maps_served", "ranged_reads"}
+
+
+def test_the_map_counts_reach_the_end_records_opportunities(arena, tmp_path, monkeypatch):
+    monkeypatch.setenv("BEEKEEPER_SYMBOLMAP", "on")
+    monkeypatch.setenv("BEEKEEPER_SPEND_DIR", str(tmp_path / "spend"))
+    bk = Scripted(arena, "t", [("read", {"file_path": "big.py"}),
+                               ("read", {"file_path": "big.py", "start_line": 40, "end_line": 44})])
+    bk.run()
+    o = _ends(tmp_path)[0]["opportunities"]
+    assert MAP_KEYS <= set(o), sorted(o)
+    assert o["big_reads"] == 1 and o["maps_served"] == 1 and o["ranged_reads"] == 1, o
+
+
+def test_the_gate_is_counted_with_the_flag_off_so_the_control_arm_reads(arena, tmp_path, monkeypatch):
+    """A run that never opened a big file and a run whose lever was off both
+    show zero maps. Only the GATE count tells them apart — H-09 was called
+    inert on a gate it never reached, and that is the fault this block exists
+    to prevent."""
+    monkeypatch.setenv("BEEKEEPER_SPEND_DIR", str(tmp_path / "spend"))
+    bk = Scripted(arena, "t", [("read", {"file_path": "big.py"}),
+                               ("read", {"file_path": "small.py"})])
+    bk.run()
+    o = _ends(tmp_path)[0]["opportunities"]
+    assert MAP_KEYS <= set(o), sorted(o)
+    assert o["big_reads"] == 1, "the gate is counted whatever the policy says"
+    assert o["maps_served"] == 0 and o["ranged_reads"] == 0, o
