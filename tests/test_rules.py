@@ -51,6 +51,7 @@ DELETED = [
 def arena(tmp_path, monkeypatch):
     monkeypatch.setenv("BEEKEEPER_CONTEXT_TOKENS", "24000")
     monkeypatch.delenv("BEEKEEPER_RULES", raising=False)
+    monkeypatch.delenv("BEEKEEPER_PHASE", raising=False)
     a = tmp_path / "arena"
     a.mkdir()
     (a / "f.py").write_text("x = 1\n")
@@ -152,3 +153,47 @@ def test_the_end_record_names_the_variant_and_its_measured_size(arena, monkeypat
     end = [r for r in recs if r.get("kind") == "end"][-1]
     assert end["rules_policy"] == "lean"
     assert 0 < end["prompt_tokens_est"] < len(SYSTEM) / 2.5
+
+
+def tool_line(body):
+    return [l for l in body["messages"][0]["content"].splitlines()
+            if l.startswith("Tools:")][0]
+
+
+def test_lean_names_only_the_tools_the_turn_offers(arena, monkeypatch):
+    """The prompt is rendered from the SAME array the request carries, so the
+    phase gate and the withhold law can never leave the two disagreeing."""
+    monkeypatch.setenv("BEEKEEPER_RULES", "lean")
+    monkeypatch.setenv("BEEKEEPER_PHASE", "on")
+    bk = build(arena)
+    bk._phase_gate(1)                      # turn one: edit and write are out
+    body = bk._request_body()
+    offered = [t["function"]["name"] for t in body["tools"]]
+    assert "edit" not in offered and "write" not in offered
+    line = tool_line(body)
+    assert "edit" not in line and "write" not in line
+    assert [n.strip() for n in line[len("Tools:"):].strip().rstrip(".").split(",")] == offered
+
+
+def test_the_render_is_per_turn_not_sticky(arena, monkeypatch):
+    monkeypatch.setenv("BEEKEEPER_RULES", "lean")
+    monkeypatch.setenv("BEEKEEPER_PHASE", "on")
+    bk = build(arena)
+    bk._phase_gate(1)
+    bk._request_body()
+    bk.phase_verified = True               # the verify has been observed
+    bk._phase_gate(2)
+    body = bk._request_body()
+    offered = [t["function"]["name"] for t in body["tools"]]
+    assert "edit" in offered and "edit" in tool_line(body)
+    assert [n.strip() for n in tool_line(body)[len("Tools:"):].strip().rstrip(".").split(",")] == offered
+
+
+def test_full_is_untouched_by_the_per_turn_render(arena, monkeypatch):
+    """The control: the schema withholds, the prompt does not move a byte."""
+    monkeypatch.setenv("BEEKEEPER_PHASE", "on")
+    bk = build(arena)                      # BEEKEEPER_RULES unset -> full
+    bk._phase_gate(1)
+    body = bk._request_body()
+    assert "edit" not in [t["function"]["name"] for t in body["tools"]]
+    assert body["messages"][0]["content"] == SYSTEM

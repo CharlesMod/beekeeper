@@ -111,11 +111,15 @@ if SEARCH_URL:
              "required": ["query"]}}})
 REGISTRY = {t['function']['name'] for t in TOOLS}
 
-def system_prompt(policy, verify_cmd=None):
-    """The system message. `full` (the default) is byte-identical to SYSTEM."""
+def system_prompt(policy, verify_cmd=None, tools=None):
+    """The system message. `full` (the default) is byte-identical to SYSTEM.
+    Under `lean` the tool line is rendered from the tools actually offered —
+    pass the turn's own array so the prompt never names a tool the schema
+    withholds."""
     if policy != 'lean':
         return SYSTEM
-    return LEAN.format(tools=', '.join(t['function']['name'] for t in TOOLS),
+    offered = TOOLS if tools is None else tools
+    return LEAN.format(tools=', '.join(t['function']['name'] for t in offered),
                        verify=verify_cmd or '(none — the task names its own check)')
 
 
@@ -1369,7 +1373,14 @@ class Beekeeper:
         think = False if self.force_no_think else self.think_now()
         budget = self.think_budget() if think else 0
         self.current_budget = budget
-        body = {"model": self.model, "messages": self.messages, "tools": self.tools(),
+        # H-07: one build of the schema (tools() consumes the turn's withhold),
+        # and the lean prompt is rendered from that same array — the phase gate
+        # and the withhold law remove a tool per turn, and a prompt that still
+        # named it would be the system lying to the model about its own hands.
+        tools = self.tools()
+        if self.rules_policy == 'lean':
+            self.messages[0]["content"] = system_prompt('lean', self.verify_cmd, tools)
+        body = {"model": self.model, "messages": self.messages, "tools": tools,
                 "temperature": self.temperature,
                 "max_tokens": (self.ANSWER_ROOM + budget) if think else self.max_tokens}
         if think is not None:
