@@ -144,6 +144,24 @@ RANGED_READ = {"type": "function", "function": {"name": "read",
         "end_line": {"type": "integer", "description": "last line to return (inclusive)"}},
         "required": ["file_path"]}}}
 
+# H-34 redirected: the edit schema the model sees when BEEKEEPER_RANGED_EDIT=on.
+# A separate constant, never a mutation of TOOLS — a flag-off worker in the
+# same process must see the shipped schema unchanged. `new_str` is required
+# because both forms need it; the ADDRESS is one of the two optional halves,
+# and a call carrying both is refused rather than resolved.
+RANGED_EDIT = {"type": "function", "function": {"name": "edit",
+    "description": ("Replace part of a file. Address it EITHER by text — old_str, which must occur "
+                    "exactly once — OR by line numbers: start_line/end_line replace exactly those "
+                    "lines (the numbers a read shows you) with new_str, so you never retype them. "
+                    "Line numbers are checked against the file as it is now."),
+    "parameters": {"type": "object", "properties": {
+        "file_path": {"type": "string"},
+        "old_str": {"type": "string", "description": "exact text to replace (omit when using line numbers)"},
+        "new_str": {"type": "string", "description": "the replacement text"},
+        "start_line": {"type": "integer", "description": "first line to replace (1-based, inclusive)"},
+        "end_line": {"type": "integer", "description": "last line to replace (inclusive; defaults to start_line)"}},
+        "required": ["file_path", "new_str"]}}}
+
 def system_prompt(policy, verify_cmd=None, tools=None):
     """The system message. `full` (the default) is byte-identical to SYSTEM.
     Under `lean` the tool line is rendered from the tools actually offered —
@@ -152,8 +170,20 @@ def system_prompt(policy, verify_cmd=None, tools=None):
     if policy != 'lean':
         return SYSTEM
     offered = TOOLS if tools is None else tools
-    return LEAN.format(tools=', '.join(t['function']['name'] for t in offered),
+    return LEAN.format(tools=', '.join(_tool_label(t) for t in offered),
                        verify=verify_cmd or '(none — the task names its own check)')
+
+
+def _tool_label(t):
+    """The name the prompt gives a tool. H-34: an ADDRESSING the schema offers
+    and the prompt never mentions is the same lie as a withheld tool the prompt
+    still names, so the ranged edit is spelled out here — from the turn's own
+    schema, so the two cannot drift. Every other tool is its bare name, which
+    keeps the flag-off prompt byte-identical."""
+    fn = t['function']
+    if fn['name'] == 'edit' and 'start_line' in fn['parameters']['properties']:
+        return 'edit (by old_str, or by start_line/end_line)'
+    return fn['name']
 
 
 def arena_anchor(policy, arena, task):
@@ -611,6 +641,20 @@ class Beekeeper:
         self.big_reads = 0               # H-51 GATE: reads of a file over the threshold, any policy
         self.maps_served = 0             # …the act: big reads answered with a map
         self.ranged_reads = 0            # …and ranges the model then asked for
+        # H-34 redirected, the ranged edit: the screen (2026-09-06) measured the
+        # repair ladder inert for the right reason — of six `not_found` edits,
+        # none matched a rung and no near-miss hint fired. The old_str the model
+        # asks to replace is not a near-miss of anything in the file: it is not
+        # in the file at all. Repair cannot reach that; addressing can. A model
+        # that has read lines 40-60 replaces lines 47-49 without retyping one
+        # character of them, and the copy step where the failure lives is gone.
+        # Off by default: with it off the edit tool's schema, its output and its
+        # refusals are unchanged, byte for byte.
+        self.ranged_edit_policy = os.environ.get('BEEKEEPER_RANGED_EDIT', '').strip().lower() or 'off'
+        self.ranged_edit_source = 'env' if os.environ.get('BEEKEEPER_RANGED_EDIT', '').strip() else 'default'
+        self.ranged_edit_calls = 0       # …the act: edits addressed by line range
+        self.ranged_edits = 0            # …of which this many applied
+        self.last_addressing = None      # 'text' | 'range' | 'file' — how the last change pointed
         # H-06, traceback capture: the same character budget buys head AND tail,
         # with the pytest failure lines lifted out of the elided middle. Off by
         # default: with it off every truncation is byte-identical.
@@ -698,6 +742,7 @@ class Beekeeper:
             f"symbolmap={self.symbolmap_policy}({self.symbolmap_source}) symbolmap_chars={self.symbolmap_chars}({self.symbolmap_chars_source}) "
             f"traceback={self.traceback_policy}({self.traceback_source}) "
             f"edit_repair={self.edit_repair_policy}({self.edit_repair_source}) "
+            f"ranged_edit={self.ranged_edit_policy}({self.ranged_edit_source}) "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -942,53 +987,117 @@ class Beekeeper:
         return (f" [the closest block in {os.path.relpath(p, self.arena)} is "
                 f"lines {hits[0] + 1}-{hits[0] + n} — re-read exactly those lines]")
 
-    def _edit_record(self, applied, repair='none', fail_class='none'):
+    def _edit_record(self, applied, repair='none', fail_class='none', addressing='text'):
         """H-34: the apply-failure rate, in the ledger instead of in a grep of
         the transcripts. Recorded under BOTH flag settings — measuring is not
         the lever — on every `edit` and `write` turn; the turn's own `action`
-        tells the two apart, and only `edit` feeds the opportunity counts."""
+        tells the two apart, and only `edit` feeds the opportunity counts.
+
+        `addressing` says HOW the change pointed at the file — `text` (old_str),
+        `range` (start_line/end_line) or `file` (a whole-file write) — so the
+        next ring compares the two edit forms' apply-failure rates by reading
+        the ledger, not by re-deriving them from the transcripts."""
         rec = {"applied": applied, "repair": repair, "fail_class": fail_class}
         self.last_edit_record = rec
+        self.last_addressing = addressing
         if self.spend_turn:
-            self.spend_turn.update(rec)
+            self.spend_turn.update(dict(rec, addressing=addressing))
         return rec
 
-    def t_edit(self, file_path, old_str, new_str):
+    def _line_span(self, p, s, start_line, end_line):
+        """H-34: a line range resolved against the file's CURRENT bytes.
+
+        Returns (start_offset, end_offset, the exact text those lines hold), or
+        (None, fail_class, refusal) when the range is not in the file as it
+        stands. A range that runs past the end is REFUSED BY NAME with the
+        current line count, never clamped: the file moved under the model's
+        remembered numbers, and a clamped range edits lines it never saw."""
+        lines = s.splitlines(keepends=True)
+        try:
+            a = int(start_line if start_line is not None else 1)
+            b = int(end_line if end_line is not None else a)
+        except (TypeError, ValueError):
+            return None, 'args', fail('args', "start_line and end_line must be whole numbers")
+        if a < 1 or b < a:
+            return None, 'args', fail('args', f"bad range {a}-{b}: 1 <= start_line <= end_line")
+        if b > len(lines):
+            rel = os.path.relpath(p, self.arena)
+            return None, 'stale_range', fail('args',
+                f"{rel} has {len(lines)} lines now; lines {a}-{b} are not all in it. The file has "
+                f"moved under those numbers — re-read it with read(file_path, start_line=A, "
+                f"end_line=B) and address the lines you see.")
+        start = sum(len(l) for l in lines[:a - 1])
+        seg = ''.join(lines[a - 1:b])
+        return start, start + len(seg), seg
+
+    def t_edit(self, file_path, old_str=None, new_str=None, start_line=None, end_line=None):
+        ranged = start_line is not None or end_line is not None
+        # These three refusals stand where a TypeError used to: an argument
+        # shape the turn's schema never offered has not cost an edit call.
+        if ranged and self.ranged_edit_policy != 'on':
+            return fail('args', "edit takes only file_path, old_str, new_str")
+        if new_str is None:
+            return fail('args', "edit needs file_path, old_str and new_str")
+        if old_str is None and not ranged:
+            return fail('args', "edit needs file_path, old_str and new_str")
         self.edit_calls += 1
+        addressing = 'range' if ranged else 'text'
+        if ranged:
+            self.ranged_edit_calls += 1
         p, note = self._inside(file_path)
         if not p:
             self.edit_failures += 1
-            self._edit_record(False, fail_class='outside')
+            self._edit_record(False, fail_class='outside', addressing=addressing)
             return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         try: s = open(p).read()
         except OSError as e:
             self.edit_failures += 1
-            self._edit_record(False, fail_class='args')
+            self._edit_record(False, fail_class='args', addressing=addressing)
             return fail('args', str(e))
         repair = 'none'
-        n = s.count(old_str)
-        if n == 0:
-            g_old, g_new, g_note, g_class = self._edit_repair(s, old_str, new_str)
-            if g_old is not None:
-                old_str, new_str, note, repair = g_old, g_new, (note or '') + g_note, g_class
-                n = s.count(old_str)
-        if n == 0:
-            self.edit_failures += 1
-            self._edit_record(False, fail_class='not_found')
-            return fail('args', "old_str not found — copy the exact lines from a fresh read, "
-                                "without the N| line-number prefixes" + self._near_miss_hint(p, s, old_str))
-        if n > 1:
-            self.edit_failures += 1
-            self._edit_record(False, repair=repair, fail_class='ambiguous')
-            return fail('args', f"old_str occurs {n} times; add context to make it unique")
+        if ranged:
+            if old_str is not None:
+                self.edit_failures += 1
+                self._edit_record(False, fail_class='args', addressing=addressing)
+                return fail('args', "address the edit ONE way: old_str, or start_line/end_line — "
+                                    "never both. Drop the one you did not mean.")
+            i, j, old_str = self._line_span(p, s, start_line, end_line)
+            if i is None:
+                self.edit_failures += 1
+                self._edit_record(False, fail_class=j, addressing=addressing)
+                return old_str           # the refusal _line_span built
+            # The replaced lines end in a newline; the model's replacement
+            # normally does not. Restoring it is not a repair — nothing was
+            # matched — it is the range form's own arithmetic.
+            if old_str.endswith('\n') and new_str and not new_str.endswith('\n'):
+                new_str += '\n'
+        else:
+            n = s.count(old_str)
+            if n == 0:
+                g_old, g_new, g_note, g_class = self._edit_repair(s, old_str, new_str)
+                if g_old is not None:
+                    old_str, new_str, note, repair = g_old, g_new, (note or '') + g_note, g_class
+                    n = s.count(old_str)
+            if n == 0:
+                self.edit_failures += 1
+                self._edit_record(False, fail_class='not_found')
+                return fail('args', "old_str not found — copy the exact lines from a fresh read, "
+                                    "without the N| line-number prefixes" + self._near_miss_hint(p, s, old_str))
+            if n > 1:
+                self.edit_failures += 1
+                self._edit_record(False, repair=repair, fail_class='ambiguous')
+                return fail('args', f"old_str occurs {n} times; add context to make it unique")
+            i = s.index(old_str)
+            j = i + len(old_str)
         # anti-Goodhart gate: an edit that ONLY changes numbers is usually tuning, not fixing.
         # Refused once; re-issuing the identical edit applies it (constants ARE sometimes wrong).
+        # It rides BOTH addressings: changing how you point never changes what is allowed.
         numeric_only = old_str != new_str and re.sub(r'[\d.]+', '#', old_str) == re.sub(r'[\d.]+', '#', new_str)
         override_key = (p, old_str, new_str)
         if numeric_only and override_key not in self.override_pending:
             self.override_pending.add(override_key)
             self.edit_failures += 1
-            self._edit_record(False, repair=repair, fail_class='numeric_only')
+            self._edit_record(False, repair=repair, fail_class='numeric_only', addressing=addressing)
             return fail('blocked', "this edit changes ONLY numeric literals. Retuning a constant to "
                                    "satisfy a test is the wrong fix — find the wrong OPERATION "
                                    "(sign, comparison, name), not the constant. If the constant itself "
@@ -998,11 +1107,11 @@ class Beekeeper:
         self._net_baseline()
         before = s.encode()
         prev_mtime = os.stat(p).st_mtime
-        open(p, 'w').write(s.replace(old_str, new_str))
+        open(p, 'w').write(s[:i] + new_str + s[j:])
         err = self._syntax_guard(p, before)
         if err:
             self.edit_failures += 1
-            self._edit_record(False, repair=repair, fail_class='parse')
+            self._edit_record(False, repair=repair, fail_class='parse', addressing=addressing)
             return err
         self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
@@ -1010,25 +1119,30 @@ class Beekeeper:
         self.last_edit_path = p          # H-05: the working set's second half
         if repair != 'none':
             self.edit_repairs += 1
-        self._edit_record(True, repair=repair)
+        if ranged:
+            self.ranged_edits += 1
+        self._edit_record(True, repair=repair, addressing=addressing)
         tag = " [numeric-only, applied on override]" if numeric_only else ""
-        self.ledger.append(f"edit {os.path.basename(p)}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}{tag}")
+        where = f" lines {start_line}-{end_line if end_line is not None else start_line}" if ranged else ""
+        self.ledger.append(f"edit {os.path.basename(p)}{where}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}{tag}")
         if numeric_only:
             return ("OK: replaced 1 occurrence. NOTE: this edit changed only numeric literals and was "
                     "applied on your override. If you are tuning a constant to satisfy a test, that is "
                     "the wrong fix — find the wrong OPERATION (sign, comparison, name) instead.")
+        if ranged:
+            return (note or '') + f"OK: replaced{where}"
         return (note or '') + "OK: replaced 1 occurrence"
 
     def t_write(self, file_path, content):
         self._net_baseline()
         p, note = self._inside(file_path)
         if not p:
-            self._edit_record(False, fail_class='outside')
+            self._edit_record(False, fail_class='outside', addressing='file')
             return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         if os.path.exists(p):
             old = open(p, errors='replace').read()
             if old.count('\n') >= 40 and len(content) < len(old) * 0.5:
-                self._edit_record(False, fail_class='shrink')
+                self._edit_record(False, fail_class='shrink', addressing='file')
                 return fail('blocked', "refusing whole-file write that shrinks a large file by >50% — "
                                        "the model tends to emit only the fragment it reasoned about; use edit")
             before = old.encode()
@@ -1039,10 +1153,10 @@ class Beekeeper:
         if before is not None:
             err = self._syntax_guard(p, before)
             if err:
-                self._edit_record(False, fail_class='parse')
+                self._edit_record(False, fail_class='parse', addressing='file')
                 return err
             self._freshen(p, prev_mtime)
-        self._edit_record(True)
+        self._edit_record(True, addressing='file')
         self.read_cache.pop(p, None)
         self.read_evicted.pop(p, None)
         self.last_edit_path = p          # H-05 (create routes through write too)
@@ -2030,6 +2144,8 @@ class Beekeeper:
         base = (TOOLS + [self._create_tool()]) if self._create_live() else TOOLS
         if self.symbolmap_policy == 'on':      # H-04: a new list; TOOLS is never mutated
             base = [RANGED_READ if t["function"]["name"] == 'read' else t for t in base]
+        if self.ranged_edit_policy == 'on':    # H-34: likewise — substitution, never mutation
+            base = [RANGED_EDIT if t["function"]["name"] == 'edit' else t for t in base]
         if not withheld:
             return base
         return [t for t in base if t["function"]["name"] not in withheld]
@@ -2212,6 +2328,7 @@ class Beekeeper:
         output it trims was already trimmed by the verify, and one overflow is
         one gate.
             edit      edit_calls, edit_failures          / edit_repairs
+            ranged_edit edit_calls                       / ranged_edit_calls, ranged_edits
         """
         return {"turns": self.turn,
                 # H-34: the gate is every edit the model asked for; a repair
@@ -2220,6 +2337,11 @@ class Beekeeper:
                 "edit_calls": self.edit_calls,
                 "edit_repairs": self.edit_repairs,
                 "edit_failures": self.edit_failures,
+                # H-34 redirected: how the model chose to point, and how often
+                # pointing by line landed — the two forms' apply rates side by
+                # side, under both settings (a control arm records zeros)
+                "ranged_edit_calls": self.ranged_edit_calls,
+                "ranged_edits": self.ranged_edits,
                 "stalls": int(self.end_reason == "stalled"),
                 "restarts": max(0, int(getattr(self, "attempt", 1)) - 1),
                 "exhaustions": self.exhaustion_events,
