@@ -130,3 +130,17 @@ def test_settings_default_reads_off(arena, capsys, monkeypatch):
     Scripted(arena, "the task", [])
     line = [l for l in capsys.readouterr().out.splitlines() if "settings:" in l][0]
     assert "restart=off(default)" in line, line
+
+
+def test_restart_floor_policy_ignores_the_median(arena, monkeypatch):
+    """Pool v2 (2026-09-06): nine stalls, nine restart decisions, none taken —
+    every stall came late, with 7–157 s left, and the median-episode rule
+    (written for pub1's 9–53 s stalls) refused them all. `BEEKEEPER_RESTART=floor`
+    restarts whenever at least the floor remains; the winners edit by ~turn 6."""
+    monkeypatch.setenv("BEEKEEPER_RESTART", "floor")
+    assert beekeeper._may_restart(left=90, walls=[400], floor=60, policy="floor") is True
+    assert beekeeper._may_restart(left=90, walls=[400], floor=60, policy="on") is False
+    assert beekeeper._may_restart(left=30, walls=[400], floor=60, policy="floor") is False
+    made = []
+    rc, attempts = beekeeper.run_attempts(_make(arena, made, [[A] * 9, [B]]), max_seconds=600)
+    assert len(attempts) == 2 and attempts[0]["reason"] == "stalled", attempts

@@ -1770,11 +1770,15 @@ class Beekeeper:
                 return self._end("stalled", 3)
         log("[beekeeper] turn limit reached"); return self._end("turn budget", 1)
 
-def _may_restart(left, walls, floor=RESTART_FLOOR_S):
+def _may_restart(left, walls, floor=RESTART_FLOOR_S, policy='on'):
     """H-12: another episode starts only while the clock holds a median
-    episode and at least the floor. No clock: the count is the only limit."""
+    episode and at least the floor. No clock: the count is the only limit.
+    Policy `floor` restarts whenever at least the floor remains — pool v2's
+    stalls came late (7–157 s left) and the median rule refused all nine."""
     if left is None:
         return True
+    if policy == 'floor':
+        return left >= float(floor)
     need = max(float(floor), statistics.median(walls) if walls else 0.0)
     return left >= need
 
@@ -1801,10 +1805,10 @@ def run_attempts(make, max_seconds=None, limit=RESTART_LIMIT):
         rec = {"attempt": attempt, "rc": rc, "reason": bk.end_reason, "turns": bk.turn,
                "wall": round(wall, 2), "sigs": sigs, "edited": edited}
         attempts.append(rec)
-        if rc != 3 or bk.restart_policy != 'on':
+        if rc != 3 or bk.restart_policy not in ('on', 'floor'):
             break
         left = None if max_seconds is None else max(0.0, max_seconds - (time.time() - t0))
-        ok = _may_restart(left, [a["wall"] for a in attempts]) and attempt < limit
+        ok = _may_restart(left, [a["wall"] for a in attempts], policy=bk.restart_policy) and attempt < limit
         bk._spend({"kind": "restart", "attempt": attempt, "reason": bk.end_reason, "turns": bk.turn,
                    "wall": round(wall, 2), "left": None if left is None else round(left, 1),
                    "restarting": bool(ok), "sigs": sigs, "edited": edited})
