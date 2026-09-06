@@ -294,6 +294,29 @@ class Beekeeper:
         if self.board_policy == 'on' and verify_cmd:
             for m in self._TEST_ID.finditer(verify_cmd):
                 self.board_rows.setdefault(f"{m.group(3)}::{m.group(4)}", ('?', 0))
+        # H-02, the trend: the checkpoint law already scores every verify
+        # (`failing_count`) and that scalar died in the ledger — the model saw a
+        # fresh red wall each turn and could not tell a fix that moved two
+        # tests from one that moved none. The board's head carries the
+        # DIRECTION: `red 2/2 → red 1/2 improving`. Off by default.
+        self.trend_policy = os.environ.get('BEEKEEPER_TREND', '').strip().lower() or 'off'
+        self.trend_source = 'env' if os.environ.get('BEEKEEPER_TREND', '').strip() else 'default'
+        self.trend_history = []          # (turn, failing count) per MEASURED verify
+        self.trend_prev = None           # the count before the latest observation
+        self.trend_now = None            # ...and after it
+        self.trend_total = None          # the denominator: the visible set
+        self.trend_dir = None            # improving | regressing | flat
+        # H-08, the ladder: H-01 seeds its rows from the ids in the verify
+        # COMMAND, so a verify that names a FILE (the public ring's shape)
+        # renders no board at all, and a run that greens one of four tests
+        # learns only that a count fell. The rungs come from pytest's own
+        # per-test lines instead, fenced to the files the verify names, and the
+        # budget is spent on the failing rungs first. The rungs ARE board rows,
+        # so the ladder writes only where H-01 gave it a board. Off by default.
+        self.ladder_policy = os.environ.get('BEEKEEPER_LADDER', '').strip().lower() or 'off'
+        self.ladder_source = 'env' if os.environ.get('BEEKEEPER_LADDER', '').strip() else 'default'
+        self.ladder_discovered = 0       # M-04: rungs the OUTPUT added to the board
+        self._verify_file_set = None     # the fence, parsed once from the verify command
         self.restart_policy = os.environ.get('BEEKEEPER_RESTART', '').strip().lower() or 'off'
         self.restart_source = 'env' if os.environ.get('BEEKEEPER_RESTART', '').strip() else 'default'
         # H-10, the phase law: the SCHEMA carries the phase, so orientation and
@@ -429,6 +452,7 @@ class Beekeeper:
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
             f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) "
+            f"trend={self.trend_policy}({self.trend_source}) ladder={self.ladder_policy}({self.ladder_source}) "
             f"phase={self.phase_policy}({self.phase_source}) phase_k={self.phase_k}({self.phase_k_source}) "
             f"alt={self.alt_policy}({self.alt_source}) alt_edits={self.alt_edits} "
             f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} "
@@ -947,17 +971,107 @@ class Beekeeper:
         otherwise the ids pytest names as FAILED/ERROR go red and the rest
         of the named set — which ran and did not fail — go green. A run
         that could not collect (exit 4/5, "no tests ran") measures nothing."""
-        if not self.board_rows:
-            return
         text = str(out or '')
+        # M-02: a red exit is not evidence that tests ran, and the trend and
+        # the ladder are as bound by that as the board is
         if code in (4, 5) or 'no tests ran' in text or 'not found:' in text:
+            return
+        if self.trend_policy == 'on':
+            self._observe_trend(code, text, turn)
+        # H-08: the rungs may be discovered by this very observation, so the
+        # ladder speaks before the row loop reads self.board_rows
+        said = self._observe_rungs(text) if (self.ladder_policy == 'on'
+                                             and self.board_policy == 'on') else {}
+        if not self.board_rows:
             return
         failing = self.failing_tests(text) if code != 0 else set()
         for tid, (state, _) in list(self.board_rows.items()):
-            new = 'red' if tid in failing else 'green'
+            new = said.get(tid) or ('red' if tid in failing else 'green')
             if new == 'green' and state != 'green':
                 self.board_flips.append((turn, tid))
             self.board_rows[tid] = (new, turn)
+
+    # ---------- H-02, the trend ----------
+    def _observe_trend(self, code, text, turn):
+        """The failing count of a MEASURED verify, and the direction it moved.
+        A green run with no summary is zero failing; an opaque red proves
+        nothing about progress and leaves the trend exactly where it was."""
+        n = self.failing_count(text)
+        if n is None and code == 0:
+            n = 0
+        if n is None:
+            return
+        self.trend_prev, self.trend_now = self.trend_now, n
+        self.trend_total = len(self.board_rows) or self._ran_total(text)
+        self.trend_dir = self._trend_dir(self.trend_prev, n)
+        self.trend_history.append((turn, n))
+        if self.spend_turn:           # the start verify runs before any turn record exists
+            self.spend_turn["trend"] = self.trend_record()
+
+    @staticmethod
+    def _trend_dir(prev, now):
+        if prev is None:
+            return None               # a first observation has no predecessor to move from
+        return 'improving' if now < prev else ('regressing' if now > prev else 'flat')
+
+    @staticmethod
+    def _ran_total(text):
+        """How many tests the run measured, from pytest's own summary — the
+        denominator when no board row set gives one. None when it says."""
+        parts = re.findall(r'(\d+) (failed|passed|errors?)\b', text or '')
+        return sum(int(n) for n, _ in parts) or None
+
+    def trend_record(self):
+        return {"prev": self.trend_prev, "now": self.trend_now,
+                "total": self.trend_total, "dir": self.trend_dir}
+
+    def _trend_seg(self):
+        """` · trend red 2/2 → red 1/2 improving`, in the units the model is
+        scored in. Empty while the lever is off or nothing has been measured;
+        no arrow and no direction word on the first observation of a run."""
+        if self.trend_policy != 'on' or self.trend_now is None:
+            return ''
+        def part(n):
+            return f"{'green' if n == 0 else 'red'} {n}" + (f"/{self.trend_total}" if self.trend_total else "")
+        if self.trend_prev is None:
+            return f" · trend {part(self.trend_now)}"
+        return f" · trend {part(self.trend_prev)} → {part(self.trend_now)} {self.trend_dir}"
+
+    # ---------- H-08, the ladder ----------
+    _RUNG_SUMMARY = re.compile(r'^(FAILED|ERROR|PASSED|XPASS|XFAIL)\s+([\w./-]+\.py::\S+?)(?: - .*)?$', re.M)
+    _RUNG_VERBOSE = re.compile(r'^([\w./-]+\.py::\S+?)\s+(FAILED|ERROR|PASSED|SKIPPED|XPASS|XFAIL)\b', re.M)
+    _PY_PATH = re.compile(r'[\w./-]+\.py')
+
+    def _verify_files(self):
+        """The files the verify command names: the ladder's fence. A command
+        that names no file at all fences nothing — there is nothing to fence
+        it to, and an unbounded rung is better than no board."""
+        if self._verify_file_set is None:
+            self._verify_file_set = {os.path.normpath(p)
+                                     for p in self._PY_PATH.findall(self.verify_cmd or '')}
+        return self._verify_file_set
+
+    def _observe_rungs(self, text):
+        """What the verify's own per-test lines said, id by id — the short
+        summary form (`FAILED tests/t.py::a - boom`) and the verbose form
+        (`tests/t.py::a FAILED [ 33%]`) alike. Ids inside the fenced files
+        that the board does not carry yet become new rungs."""
+        said = {}
+        for m in self._RUNG_SUMMARY.finditer(text):
+            said[m.group(2)] = 'red' if m.group(1) in ('FAILED', 'ERROR') else 'green'
+        for m in self._RUNG_VERBOSE.finditer(text):
+            said.setdefault(m.group(1), 'red' if m.group(2) in ('FAILED', 'ERROR') else 'green')
+        named = self._verify_files()
+        bases = {os.path.basename(p) for p in named}
+        def inside(tid):
+            f = tid.split('::')[0]
+            return (not named) or os.path.normpath(f) in named or os.path.basename(f) in bases
+        said = {t: s for t, s in said.items() if inside(t)}
+        for tid in said:
+            if tid not in self.board_rows:
+                self.board_rows[tid] = ('?', 0)
+                self.ladder_discovered += 1
+        return said
 
     def _render_board(self, turn):
         """One message, rebuilt in place every turn, pinned: the visible tests
@@ -969,9 +1083,15 @@ class Beekeeper:
         if self.max_seconds:
             left = f" · {max(0, int(self.max_seconds - (time.time() - self.t0)))}s left"
         edited = sorted(self._changed_files())[:4]
-        head = f"[Board t{turn}{left} · edits {len(edited)}" + (f" ({', '.join(edited)})" if edited else "") + "]"
+        head = (f"[Board t{turn}{left} · edits {len(edited)}"
+                + (f" ({', '.join(edited)})" if edited else "") + self._trend_seg() + "]")
         rows = []
-        for tid, (state, seen) in self.board_rows.items():
+        items = list(self.board_rows.items())
+        if self.ladder_policy == 'on':
+            # H-08: the budget is spent on the rungs that still fail — a stable
+            # sort, so within a state the rows keep the order they arrived in
+            items.sort(key=lambda kv: {'red': 0, '?': 1, 'green': 2}.get(kv[1][0], 3))
+        for tid, (state, seen) in items:
             rows.append(f"{mark[state]} {tid} — {state}" + (f" (t{seen})" if seen else " (start)"))
         shown, rest = rows[:12], rows[12:]
         body = "\n".join([head] + shown + ([f"… +{len(rest)} more rows"] if rest else []))[:1200]
@@ -1452,6 +1572,8 @@ class Beekeeper:
             restart   stalls                             / restarts
             withhold  exhaustions, refusals              / withheld_turns
             board     board_rows                         / board_flips
+            trend     trend_observations                 / trend_improvements, trend_regressions
+            ladder    ladder_rungs                       / ladder_discovered
             net       net_baselines, net_gate_reached    / net_refusals
             think     turns                              / think_turns
             create    create_offers                      / create_taken
@@ -1464,6 +1586,15 @@ class Beekeeper:
                 "withheld_turns": self.withheld_turns,
                 "board_rows": len(self.board_rows),
                 "board_flips": len(self.board_flips),
+                # trend    the gate: verifies that MEASURED something / the moves
+                "trend_observations": len(self.trend_history),
+                "trend_improvements": sum(1 for a, b in zip(self.trend_history, self.trend_history[1:])
+                                          if b[1] < a[1]),
+                "trend_regressions": sum(1 for a, b in zip(self.trend_history, self.trend_history[1:])
+                                         if b[1] > a[1]),
+                # ladder   the gate: rungs on the board / the ones the output added
+                "ladder_rungs": len(self.board_rows),
+                "ladder_discovered": self.ladder_discovered,
                 "net_baselines": self.net_baselines,
                 "net_gate_reached": self.net_gate_reached,
                 "net_refusals": self.net_refusals,
@@ -1700,7 +1831,10 @@ class Beekeeper:
                 self.after_verify = is_verify
                 if is_verify:
                     self.last_verify_red = not str(result).startswith('exit 0')
-                    if self.board_rows:
+                    # the board has rows to flip, or the trend/ladder have their
+                    # own reason to read this observation (a ladder run starts
+                    # with no rows at all — the output is where they come from)
+                    if self.board_rows or self.trend_policy == 'on' or self.ladder_policy == 'on':
                         m0 = re.match(r'exit (\d+)', str(result))
                         self._observe(int(m0.group(1)) if m0 else (1 if self.last_verify_red else 0), str(result), turn)
                     self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
