@@ -40,6 +40,22 @@ ALT_EDITS = 3       # H-33: successive edits with an unchanged verify outcome be
 CREATE_OFFER_TURNS = 3  # H-56: turns a create offer stays in the schema before it expires
 RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
 RESTART_FLOOR_S = 60  # never restart into less than this many seconds
+EVICT_HEAD = 1200   # H-05: chars of the last verify output's head kept under pressure
+EVICT_TAIL = 1200   # ... and of its tail (the summary line lives at the end)
+
+# H-05: the files a task names — the working set's first half. A superset filter
+# (a version number reads as a path-ish token); it is matched against basenames
+# that were actually read, so a spurious one never matches anything.
+_PATHISH = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9_]{1,5}')
+
+
+def named_files(text):
+    out = set()
+    for m in _PATHISH.finditer(text or ''):
+        base = m.group(0).replace('\\', '/').rstrip('.').rsplit('/', 1)[-1]
+        if '.' in base:
+            out.add(base)
+    return out
 PHASE_K = 6         # H-10: the turn by which the first edit is forced (the ring's winners edit by turn 6)
 AUTOVERIFY_MAX_S = 90  # H-32: a verify this slow is not spent unasked (docker verifies cost 20-90 s)
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
@@ -199,6 +215,18 @@ class Beekeeper:
         self.read_cache = {}
         self.read_msgs = {}                  # message idx -> path, so eviction can un-cache reads
         self.last_full_read = None
+        # H-05, the eviction policy (budget-law.md §5). `basic` is the policy as
+        # shipped; `working-set` never evicts the files the task names, the last
+        # edited file or the last verify output, never un-caches a read, keeps
+        # the collapse anchors, and leaves a ledger fact where basic leaves an
+        # instruction. The 09-03 ring's sixty identical reads were all of those
+        # faults at once, under a budget that was assumed rather than measured.
+        self.evict_policy = os.environ.get('BEEKEEPER_EVICT', '').strip().lower() or 'basic'
+        self.evict_source = 'env' if os.environ.get('BEEKEEPER_EVICT', '').strip() else 'default'
+        self.task_files = named_files(task)   # the working set's first half
+        self.last_edit_path = None            # ... and its second: the file last written
+        self.last_verify_idx = None           # message index of the most recent verify output
+        self.read_evicted = {}                # path -> (lines, turn): where a read's content went
         self.ledger = []
         self.sig_history = []            # (norm_sig, ok) trail for loop pivot
         self.poison = {}                 # norm_sig -> crash count
@@ -390,6 +418,7 @@ class Beekeeper:
             f"phase={self.phase_policy}({self.phase_source}) phase_k={self.phase_k}({self.phase_k_source}) "
             f"alt={self.alt_policy}({self.alt_source}) alt_edits={self.alt_edits} "
             f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} "
+            f"evict={self.evict_policy}({self.evict_source}) "
             f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
@@ -482,6 +511,13 @@ class Beekeeper:
         sha = hashlib.sha1(body.encode()).hexdigest()
         self.last_full_read = None
         if self.read_cache.get(p) == sha:
+            # H-05: a read whose result was evicted is still served FROM THE
+            # CACHE — never re-sent whole, which is what un-caching used to
+            # force. The reply says where the content went; it gives no order.
+            if self.evict_policy == 'working-set' and p in self.read_evicted:
+                lines, turn = self.read_evicted[p]
+                return (f"[unchanged since your last read — read {os.path.relpath(p, self.arena)}, "
+                        f"{lines} lines, evicted at turn {turn}]")
             return "[unchanged since your last read — you already have this file in context]"
         self.read_cache[p] = sha
         self.last_full_read = p
@@ -568,6 +604,8 @@ class Beekeeper:
         if err: return err
         self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
+        self.read_evicted.pop(p, None)
+        self.last_edit_path = p          # H-05: the working set's second half
         tag = " [numeric-only, applied on override]" if numeric_only else ""
         self.ledger.append(f"edit {os.path.basename(p)}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}{tag}")
         if numeric_only:
@@ -595,6 +633,8 @@ class Beekeeper:
             if err: return err
             self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
+        self.read_evicted.pop(p, None)
+        self.last_edit_path = p          # H-05 (create routes through write too)
         self.ledger.append(f"write {os.path.basename(p)} ({len(content)} chars)")
         return (note or '') + f"OK: wrote {len(content)} chars"
 
@@ -940,6 +980,8 @@ class Beekeeper:
             self.read_msgs = {i + 1 if i >= 2 else i: p for i, p in self.read_msgs.items()}
             if getattr(self, 'last_result_idx', None) is not None and self.last_result_idx >= 2:
                 self.last_result_idx += 1
+            if self.last_verify_idx is not None and self.last_verify_idx >= 2:
+                self.last_verify_idx += 1
             self.exhausted_idx = {k: (v + 1 if v >= 2 else v) for k, v in self.exhausted_idx.items()}
         else:
             self.messages[idx]["content"] = body
@@ -1192,30 +1234,143 @@ class Beekeeper:
                    for m in self.messages)
 
     def compact(self, hard=False):
+        """H-05. Two policies, chosen by BEEKEEPER_EVICT; `basic` is the one
+        that shipped. Either way the compaction is recorded in the spend
+        ledger — naming what left the context and what stayed — so that the
+        control arm is readable too (M-04: a lever whose gate was never
+        reached is unmeasured, not inert)."""
         self.compactions += 1
+        before = self._size()
+        if self.evict_policy == 'working-set':
+            evicted, kept = self._compact_working_set(hard)
+        else:
+            evicted, kept = self._compact_basic(hard)
+        self._spend({"kind": "compact", "turn": self.turn, "hard": bool(hard),
+                     "policy": self.evict_policy, "evicted": evicted[:40], "kept": kept[:40],
+                     "n_evicted": len(evicted), "n_kept": len(kept), "compactions": self.compactions,
+                     "chars_before": before, "chars_after": self._size()})
+
+    def _compact_basic(self, hard):
         keep = 4 if hard else 8
         n = len(self.messages)
         evictable = [i for i in range(2, n - keep) if i not in self.pin_idx]
-        if not evictable: return
-        dropped = 0
+        if not evictable: return [], []
+        evicted, kept = [], []
         for i in evictable:
             m = self.messages[i]
             if m.get('role') == 'tool' and len(str(m.get('content') or '')) > 200:
+                evicted.append(self._msg_label(i))
                 m['content'] = "(evicted to fit context — re-run the tool if needed)"
-                dropped += 1
                 # evicting a read result means the model no longer has that file:
                 # un-cache it so the re-run this notice asks for actually serves content
                 if i in self.read_msgs:
                     self.read_cache.pop(self.read_msgs.pop(i), None)
-        if dropped:
+        if evicted:
             self.last_result, self.repeat_run = (None, None), 0
         ledger = '\n'.join(self.ledger[-30:]) or '(none yet)'
         self.messages.insert(2, {"role": "user", "content":
-            f"[context compacted: {dropped} old tool results elided. Action ledger:\n{ledger}\n"
+            f"[context compacted: {len(evicted)} old tool results elided. Action ledger:\n{ledger}\n"
             f"Do not re-read unchanged files.]"})
+        # the shipped policy shifts only these two: the collapse anchors going
+        # stale here is part of what `working-set` fixes, and the control does
+        # not get the fix
         self.pin_idx = {i + 1 if i >= 2 else i for i in self.pin_idx}
         self.read_msgs = {i + 1 if i >= 2 else i: p for i, p in self.read_msgs.items()}
-        log(f"[beekeeper] compacted ({'hard' if hard else 'soft'}): {dropped} results elided")
+        log(f"[beekeeper] compacted ({'hard' if hard else 'soft'}): {len(evicted)} results elided")
+        return evicted, kept
+
+    def _working_set(self):
+        """The files this run is actually working on: the ones the task names
+        and the one last edited. Basenames, because the model writes relative
+        paths and the harness stores absolute ones."""
+        work = set(self.task_files)
+        if self.last_edit_path:
+            work.add(os.path.basename(self.last_edit_path))
+        return work
+
+    def _msg_label(self, i):
+        p = self.read_msgs.get(i)
+        if p:
+            return f"read {os.path.relpath(p, self.arena)}"
+        if i == self.last_verify_idx:
+            return "verify"
+        return f"tool#{i}"
+
+    def _shift_indices(self):
+        """One message was inserted at index 2: every index the harness holds
+        into self.messages moves with it. last_result_idx and exhausted_idx
+        are the collapse machinery's anchors — a compaction that forgot them
+        rewrote the wrong message on the next repeat."""
+        bump = lambda i: i + 1 if i >= 2 else i
+        self.pin_idx = {bump(i) for i in self.pin_idx}
+        self.read_msgs = {bump(i): p for i, p in self.read_msgs.items()}
+        self.exhausted_idx = {k: bump(v) for k, v in self.exhausted_idx.items()}
+        if self.last_result_idx is not None:
+            self.last_result_idx = bump(self.last_result_idx)
+        if self.last_verify_idx is not None:
+            self.last_verify_idx = bump(self.last_verify_idx)
+
+    @staticmethod
+    def _head_tail(s, head=EVICT_HEAD, tail=EVICT_TAIL):
+        if len(s) <= head + tail:
+            return s
+        return f"{s[:head]}\n[... {len(s) - head - tail} chars elided ...]\n{s[-tail:]}"
+
+    def _compact_working_set(self, hard):
+        """H-05, budget-law.md §5. The working set — the files the task names,
+        the last edited file, the last verify output's head and tail — is never
+        evicted; nothing is un-cached; the placeholder states a ledger fact and
+        gives no instruction; the repeat counter and the collapse anchors are
+        untouched; and the notice is ONE message rebuilt in place (I7: a budget
+        message is never a pattern the model completes). The 09-03 ring's sixty
+        identical reads were the opposite of every clause here."""
+        keep = 4 if hard else 8
+        n = len(self.messages)
+        safe = set(self.pin_idx)
+        for i in (self.last_verify_idx, self.last_result_idx):
+            if i is not None:
+                safe.add(i)
+        safe |= {i for i in self.exhausted_idx.values() if i is not None}
+        work = self._working_set()
+        evicted, kept = [], []
+        for i in range(2, n - keep):
+            m = self.messages[i]
+            body = str(m.get('content') or '')
+            if m.get('role') != 'tool' or len(body) <= 200:
+                continue
+            path = self.read_msgs.get(i)
+            if i in safe or (path and os.path.basename(path) in work):
+                if i == self.last_verify_idx:
+                    m['content'] = self._head_tail(body)
+                kept.append(self._msg_label(i))
+                continue
+            evicted.append(self._msg_label(i))
+            lines = body.count('\n') + 1
+            if path:
+                rel = os.path.relpath(path, self.arena)
+                m['content'] = f"[read {rel}, {lines} lines, evicted at turn {self.turn}]"
+                # the cache is NOT dropped: a re-read is served from it, never
+                # re-sent whole. What is remembered is where the content went.
+                self.read_evicted[path] = (lines, self.turn)
+                del self.read_msgs[i]
+            else:
+                m['content'] = f"[{len(body)} chars of tool output, evicted at turn {self.turn}]"
+        ledger = '\n'.join(self.ledger[-30:]) or '(none yet)'
+        body = (f"[context compacted {self.compactions}x; {len(evicted)} tool results elided, "
+                f"{len(kept)} kept. Action ledger:\n{ledger}]")
+        idx = next((i for i, m in enumerate(self.messages)
+                    if m.get('role') == 'user'
+                    and str(m.get('content') or '').startswith('[context compacted')), None)
+        if idx is None:
+            self.messages.insert(2, {"role": "user", "content": body})
+            self._shift_indices()
+            self.pin_idx.add(2)
+        else:
+            self.messages[idx]['content'] = body
+            self.pin_idx.add(idx)
+        log(f"[beekeeper] compacted ({'hard' if hard else 'soft'}, working-set): "
+            f"{len(evicted)} results elided, {len(kept)} kept")
+        return evicted, kept
 
     def _pin_red(self, idx, content):
         """Never evict the most recent failing verify/test output (hive NEVER_TRIM)."""
@@ -1735,6 +1890,8 @@ class Beekeeper:
                     self.last_result_idx = idx
                 self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": str(result)})
                 self._pin_red(idx, str(result))
+                if is_verify:
+                    self.last_verify_idx = idx      # H-05: never evicted head and tail
                 if name == 'read' and self.last_full_read:
                     self.read_msgs[idx] = self.last_full_read
                 if changed_world:
