@@ -394,6 +394,99 @@ def salvage_tool_calls(text):
                                          else json.dumps(args)}})
     return out
 
+# ---------- H-03, the checkpoint law (a port of hive's quorum/checkpoint.py) ----------
+# State the ledger must neither record nor clean. `.git` first: the arena is
+# often a git checkout of the task's own repo, and the shadow ledger must leave
+# that repo's HEAD, history and index exactly as it found them.
+_LEDGER_SKIP = (".git", ".hg", ".svn", ".venv", "__pycache__", ".pytest_cache",
+                "node_modules", "vendor", ".spool", ".tox", ".mypy_cache")
+
+
+class _Ledger:
+    """The shadow ledger over one run's arena.
+
+    A DETACHED git dir (a tempdir outside the arena, addressed with --git-dir
+    and --work-tree) so nothing is written into a repo the task itself uses and
+    no harness commit ever lands in the arena's own history. `observe` commits
+    whenever the failing count strictly improves on the best committed state;
+    `restore_best` puts the tree back to that state — best-green, else
+    best-partial, else the scored baseline — and `close` removes the ledger,
+    never the tree.
+
+    Monotone by construction: restoring a committed, MEASURED state can only
+    recover value, never invent it. Exit codes still decide everything
+    downstream; the ledger just puts the tree back into its best observed shape
+    before the referee looks."""
+
+    def __init__(self, work_dir, exclude=()):
+        self.work_dir = os.path.realpath(work_dir)
+        self.git_dir = tempfile.mkdtemp(prefix="beekeeper-ckpt-")
+        self._git("init", "-q")
+        for k, v in (("user.name", "beekeeper-checkpoint"),
+                     ("user.email", "checkpoint@beekeeper"),
+                     ("commit.gpgsign", "false"),
+                     ("core.autocrlf", "false"),
+                     ("core.hooksPath", os.devnull),
+                     ("gc.auto", "0"),
+                     ("core.excludesfile", os.devnull)):
+            self._git("config", k, v)
+        info = os.path.join(self.git_dir, "info")
+        os.makedirs(info, exist_ok=True)
+        with open(os.path.join(info, "exclude"), "w") as fh:
+            fh.write("\n".join([f"{d}/" for d in _LEDGER_SKIP] + [str(p) for p in exclude]) + "\n")
+        self.best_sha = None
+        self.best_failing = None
+        self.last_failing = None
+        self.n_commits = 0               # states committed, the baseline included
+        self.n_scored = 0                # M-04: MEASURED verifies — the gate
+        self.restores = 0
+        self.baseline_sha = self._commit("checkpoint: baseline")
+
+    def _git(self, *args):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        r = subprocess.run(["git", "--git-dir", self.git_dir, "--work-tree", self.work_dir, *args],
+                           capture_output=True, text=True, cwd=self.work_dir, env=env, timeout=180)
+        if r.returncode != 0:
+            raise RuntimeError(f"checkpoint git {args[0]}: {(r.stderr or r.stdout).strip()[:300]}")
+        return r
+
+    def _commit(self, label):
+        self._git("add", "-A")
+        self._git("commit", "-q", "--no-verify", "--allow-empty", "-m", label)
+        self.n_commits += 1
+        return self._git("rev-parse", "HEAD").stdout.strip()
+
+    def observe(self, failing):
+        """Score one MEASURED verify (the caller scores it — there is exactly
+        one scorer in the worker). Commits when the count strictly improves."""
+        self.n_scored += 1
+        self.last_failing = failing
+        if self.best_failing is None or failing < self.best_failing:
+            sha = self._commit(f"checkpoint: failing={failing}")
+            self.best_sha, self.best_failing = sha, failing
+            return {"committed": True, "failing": failing, "sha": sha}
+        return {"committed": False, "failing": failing}
+
+    def restore_best(self):
+        """Restore the best committed state when the last measured one is
+        strictly worse. Never restores over an equal-or-better tree."""
+        if (self.best_sha is None or self.last_failing is None
+                or self.last_failing <= self.best_failing):
+            return {"restored": False, "failing": self.last_failing,
+                    "best_failing": self.best_failing}
+        was = self.last_failing
+        self._git("read-tree", "--reset", self.best_sha)
+        self._git("checkout-index", "-a", "-f")
+        self._git("clean", "-qfd")
+        self.last_failing = self.best_failing
+        self.restores += 1
+        return {"restored": True, "failing": self.best_failing, "was_failing": was,
+                "green": self.best_failing == 0, "sha": self.best_sha}
+
+    def close(self):
+        shutil.rmtree(self.git_dir, ignore_errors=True)
+
+
 class Beekeeper:
     ANSWER_ROOM = 700                    # tokens left for the tool call after a think block closes
 
@@ -559,6 +652,21 @@ class Beekeeper:
         # measuring is not a lever — and only the ladder rides the flag.
         self.edit_repair_policy = os.environ.get('BEEKEEPER_EDIT_REPAIR', '').strip().lower() or 'off'
         self.edit_repair_source = 'env' if os.environ.get('BEEKEEPER_EDIT_REPAIR', '').strip() else 'default'
+        # H-03, the checkpoint law. hive's `quorum/checkpoint.py` cures the
+        # largest measured agentic failure class — the agent destroying its own
+        # already-correct edits — but it lives in the episode runner, and the
+        # ring's bench episodes deliberately run bare so the corpus stays
+        # comparable. So the class is uncured exactly where it is measured. The
+        # law, inside the worker: every MEASURED verify is scored, a state that
+        # strictly improves on the best is committed to a shadow ledger, and any
+        # end that is not a green cap restores the best committed state. Off by
+        # default; with it off no ledger exists and the run is byte-identical.
+        self.checkpoint_policy = os.environ.get('BEEKEEPER_CHECKPOINT', '').strip().lower() or 'off'
+        self.checkpoint_source = 'env' if os.environ.get('BEEKEEPER_CHECKPOINT', '').strip() else 'default'
+        self.ckpt = None                 # the ledger, or None while the lever is off
+        self.ckpt_restored = None        # what _end restored, and from which state
+        self.ckpt_scores = 0             # M-04 GATE: measured verifies, counted in EVERY arm
+        self.ckpt_commits = 0            # …the act: states the ledger kept
         self.edit_calls = 0              # M-04: the gate — every edit the model asked for
         self.edit_repairs = 0            # ...of which this many needed a normalisation to apply
         self.edit_failures = 0           # ...and this many applied nothing at all
@@ -674,6 +782,7 @@ class Beekeeper:
             self.net_baseline = set(net_baseline)   # a restart carries the baseline measured before the FIRST edit
             self._net_record(failing=len(self.net_baseline), names=sorted(self.net_baseline)[:40],
                              carried=True)
+        self._ckpt_open()                # the baseline commit precedes the start verify's score
         if verify_cmd and start_verify:
             code, out0 = self._run_verify()
             self._observe(code, out0, turn=0)
@@ -698,6 +807,7 @@ class Beekeeper:
             f"symbolmap={self.symbolmap_policy}({self.symbolmap_source}) symbolmap_chars={self.symbolmap_chars}({self.symbolmap_chars_source}) "
             f"traceback={self.traceback_policy}({self.traceback_source}) "
             f"edit_repair={self.edit_repair_policy}({self.edit_repair_source}) "
+            f"checkpoint={self.checkpoint_policy}({self.checkpoint_source}) "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -1434,6 +1544,7 @@ class Beekeeper:
         # the ladder are as bound by that as the board is
         if self._unmeasured(code, text):
             return
+        self._ckpt_observe(code, text, turn)     # H-03: this state was MEASURED; score it
         if self.trend_policy == 'on':
             self._observe_trend(code, text, turn)
         # H-08: the rungs may be discovered by this very observation, so the
@@ -1448,6 +1559,99 @@ class Beekeeper:
             if new == 'green' and state != 'green':
                 self.board_flips.append((turn, tid))
             self.board_rows[tid] = (new, turn)
+
+    # ---------- H-03, the checkpoint law ----------
+    def _ckpt_score(self, code, out):
+        """The law's measure of ONE verify, in the worker's own units — there
+        is exactly one scorer here and this is it: `failing_count` reads
+        pytest's summary, exit 0 IS green, and an opaque red scores 1 because
+        partial progress is only measurable where the verify counts.
+
+        M-02: a run that measured nothing (exit 4/5, "no tests ran") returns
+        None. Unmeasured is never zero, and never a checkpoint."""
+        text = str(out or '')
+        if self._unmeasured(code, text):
+            return None
+        n = self.failing_count(text)
+        if n is not None:
+            return n
+        return 0 if code == 0 else 1
+
+    def _ckpt_open(self):
+        """The shadow ledger, opened over the arena before the start verify so
+        the pristine tree is itself a restorable state. A ledger that cannot be
+        made (no git, an unwritable tmp) is recorded and the run continues
+        exactly as it would with the lever off — the law never costs a run."""
+        if self.checkpoint_policy != 'on':
+            return
+        try:
+            self.ckpt = _Ledger(self.arena)
+            log(f"[beekeeper] checkpoint: shadow ledger at {self.ckpt.git_dir} "
+                f"(baseline {self.ckpt.baseline_sha[:8]})")
+        except Exception as e:                       # noqa: BLE001 — never fatal
+            self.ckpt = None
+            log(f"[beekeeper] checkpoint: ledger unavailable ({type(e).__name__}: {str(e)[:120]})")
+            self._spend({"kind": "checkpoint", "stage": "error", "op": "open",
+                         "error": f"{type(e).__name__}: {str(e)[:200]}"})
+
+    def _ckpt_observe(self, code, text, turn):
+        """Score this measured state and keep it if it strictly improves on the
+        best. The score is taken in every arm (M-04: measuring is not a lever);
+        only the commit rides the flag."""
+        n = self._ckpt_score(code, text)
+        if n is None:
+            return
+        self.ckpt_scores += 1
+        if self.ckpt is None:
+            return
+        try:
+            r = self.ckpt.observe(n)
+        except Exception as e:                       # noqa: BLE001
+            self._ckpt_fail("observe", e)
+            return
+        if r.get("committed"):
+            self.ckpt_commits += 1
+            log(f"[beekeeper t{turn}] checkpoint: kept failing={n} ({r['sha'][:8]})")
+            self._spend({"kind": "checkpoint", "stage": "commit", "turn": turn,
+                         "failing": n, "sha": r["sha"]})
+
+    def _ckpt_fail(self, op, e):
+        """A ledger that breaks mid-run is disabled and said out loud. It never
+        takes the run with it, and it never restores from a state it is no
+        longer sure of."""
+        log(f"[beekeeper] checkpoint: {op} failed ({type(e).__name__}: {str(e)[:160]}) — ledger disabled")
+        self._spend({"kind": "checkpoint", "stage": "error", "op": op,
+                     "error": f"{type(e).__name__}: {str(e)[:200]}"})
+        try:
+            self.ckpt.close()
+        except Exception:                            # noqa: BLE001
+            pass
+        self.ckpt = None
+
+    def _ckpt_close(self, reason, rc):
+        """The law at the end of the run: anything but a GREEN CAP restores the
+        best committed state — best-green, else best-partial, else the scored
+        baseline. A green cap is never restored over: the tree the referee sees
+        is the tree the model capped on."""
+        if self.ckpt is None:
+            return
+        green_cap = reason == "capped" and rc == 0
+        try:
+            r = {"restored": False, "reason": "green cap"} if green_cap else self.ckpt.restore_best()
+        except Exception as e:                       # noqa: BLE001
+            self._ckpt_fail("restore", e)
+            return
+        r = dict(r, stage="restore", kind="checkpoint", end=reason)
+        if r.get("restored"):
+            self.ckpt_restored = {k: r.get(k) for k in ("failing", "was_failing", "green", "sha")}
+            log(f"[beekeeper] checkpoint: restored the best committed state "
+                f"({'green' if r['green'] else 'partial'}, failing={r['failing']}, {r['sha'][:8]}) "
+                f"over a final failing={r['was_failing']} — end={reason}")
+        else:
+            log(f"[beekeeper] checkpoint: nothing restored ({r.get('reason') or 'no worse state to undo'}); "
+                f"scored={self.ckpt.n_scored} kept={self.ckpt_commits}")
+        self._spend(r)
+        self.ckpt.close()                # the ledger goes; the tree stays
 
     # ---------- H-02, the trend ----------
     def _observe_trend(self, code, text, turn):
@@ -2207,6 +2411,7 @@ class Beekeeper:
             create    create_offers                      / create_taken
             symbolmap big_reads                          / maps_served, ranged_reads
             traceback truncations                        / clips
+            checkpoint checkpoint_scores                 / checkpoints, checkpoint_restores
 
         The auto-verify body's own re-clip is deliberately not counted: the
         output it trims was already trimmed by the verify, and one overflow is
@@ -2246,7 +2451,12 @@ class Beekeeper:
                 "maps_served": self.maps_served,
                 "ranged_reads": self.ranged_reads,
                 "truncations": self.truncations,
-                "clips": self.clips}
+                "clips": self.clips,
+                # checkpoint  the gate: MEASURED verifies (scored in every arm)
+                #             / the acts: states kept, and the one restore
+                "checkpoint_scores": self.ckpt_scores,
+                "checkpoints": self.ckpt_commits,
+                "checkpoint_restores": int(bool(self.ckpt_restored))}
 
     def _net_end_record(self):
         """H-09c: a run that ended before anything asked for a baseline still
@@ -2270,7 +2480,10 @@ class Beekeeper:
             self._spend(self.spend_turn); self.spend_turn = {}
         self._close_create_offer()       # a live offer is recorded before the end record
         self._net_end_record()           # ...and so is the baseline, measured or not
+        self._ckpt_close(reason, rc)     # H-03: the tree is put back BEFORE the end record names it
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
+                     "checkpoint_policy": self.checkpoint_policy,
+                     "restored": self.ckpt_restored,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
                      "think_policy": self.think_policy,
@@ -2497,7 +2710,8 @@ class Beekeeper:
                     # the board has rows to flip, or the trend/ladder have their
                     # own reason to read this observation (a ladder run starts
                     # with no rows at all — the output is where they come from)
-                    if self.board_rows or self.trend_policy == 'on' or self.ladder_policy == 'on':
+                    if (self.board_rows or self.trend_policy == 'on' or self.ladder_policy == 'on'
+                            or self.checkpoint_policy == 'on'):
                         m0 = re.match(r'exit (\d+)', str(result))
                         self._observe(int(m0.group(1)) if m0 else (1 if self.last_verify_red else 0), str(result), turn)
                     self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
