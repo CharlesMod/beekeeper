@@ -488,14 +488,16 @@ class Beekeeper:
         self.symbolmap_chars = int(os.environ.get('BEEKEEPER_SYMBOLMAP_CHARS') or SYMBOLMAP_CHARS)
         self.symbolmap_chars_source = 'env' if os.environ.get('BEEKEEPER_SYMBOLMAP_CHARS') else 'default'
         self.mapped = set()              # paths whose last serve was a map, not a body
-        self.maps_served = 0             # H-51 opportunity counts: big reads answered with a map
+        self.big_reads = 0               # H-51 GATE: reads of a file over the threshold, any policy
+        self.maps_served = 0             # …the act: big reads answered with a map
         self.ranged_reads = 0            # …and ranges the model then asked for
         # H-06, traceback capture: the same character budget buys head AND tail,
         # with the pytest failure lines lifted out of the elided middle. Off by
         # default: with it off every truncation is byte-identical.
         self.traceback_policy = os.environ.get('BEEKEEPER_TRACEBACK', '').strip().lower() or 'off'
         self.traceback_source = 'env' if os.environ.get('BEEKEEPER_TRACEBACK', '').strip() else 'default'
-        self.clips = 0                   # H-51: outputs that were too big to keep whole
+        self.truncations = 0             # H-51 GATE: outputs too big to keep whole, any policy
+        self.clips = 0                   # …the act: truncations spent on both ends
         # H-51 (M-04): every lever's OPPORTUNITY count, kept where the lever acts
         self.attempt = 1                 # run_attempts overwrites it; restarts = attempt - 1
         self.exhaustion_events = 0       # actions the stall law exhausted
@@ -695,6 +697,8 @@ class Beekeeper:
             return "[unchanged since your last read — you already have this file in context]"
         self.read_cache[p] = sha
         self.last_full_read = p
+        if len(body) > self.symbolmap_chars:
+            self.big_reads += 1          # M-04: the gate is counted whatever the policy says
         if self.symbolmap_policy == 'on' and len(body) > self.symbolmap_chars:
             m = symbol_map(p, body, SYMBOLMAP_MAX)
             if m:                            # a file with no shape keeps head+tail
@@ -1020,6 +1024,7 @@ class Beekeeper:
             self.poison[sig] = self.poison.get(sig, 0) + 1
         out = (out or '').strip() or "(no output)"
         if len(out) > 3500:
+            self.truncations += 1        # M-04: the gate, counted in the control arm too
             # H-06: the same budget, spent on both ends. The head-only cut threw
             # away the assertion, the last frames and the FAILED summary — the
             # only part of a pytest run that says what to do next.
@@ -1316,12 +1321,10 @@ class Beekeeper:
             whole = r.stdout + r.stderr
             # H-06: the verify's mirror fault — the tail alone drops the command,
             # the collection line and the first error that explains the rest.
-            if self.traceback_policy == 'on':
-                if len(whole) > 1500:
-                    self.clips += 1
-                out = clip_output(whole, 1500)
-            else:
-                out = whole[-1500:]
+            if len(whole) > 1500:
+                self.truncations += 1
+                self.clips += self.traceback_policy == 'on'
+            out = clip_output(whole, 1500) if self.traceback_policy == 'on' else whole[-1500:]
             code = r.returncode
         except subprocess.TimeoutExpired:
             code, out = 124, "verify timed out"
@@ -1640,6 +1643,12 @@ class Beekeeper:
             net       net_baselines, net_gate_reached    / net_refusals
             think     turns                              / think_turns
             create    create_offers                      / create_taken
+            symbolmap big_reads                          / maps_served, ranged_reads
+            traceback truncations                        / clips
+
+        The auto-verify body's own re-clip is deliberately not counted: the
+        output it trims was already trimmed by the verify, and one overflow is
+        one gate.
         """
         return {"turns": self.turn,
                 "stalls": int(self.end_reason == "stalled"),
@@ -1654,7 +1663,12 @@ class Beekeeper:
                 "net_refusals": self.net_refusals,
                 "think_turns": sum(1 for _, t in self.think_log if t),
                 "create_offers": self.create_offers,
-                "create_taken": self.create_taken}
+                "create_taken": self.create_taken,
+                "big_reads": self.big_reads,
+                "maps_served": self.maps_served,
+                "ranged_reads": self.ranged_reads,
+                "truncations": self.truncations,
+                "clips": self.clips}
 
     def _end(self, reason, rc):
         self.end_reason = reason

@@ -17,6 +17,7 @@ Laws:
     traceback frames never fall into the elided middle: if they sit there
     they are lifted out and kept.
 """
+import json
 import os
 import sys
 
@@ -199,3 +200,55 @@ def test_flag_off_the_autoverify_body_is_the_tail_alone(arena, monkeypatch):
     bk._autoverify(1)
     body = [m for m in bk.messages if str(m.get("content", "")).startswith("[auto-verify")][0]["content"]
     assert "FIRST LINE" not in body and "LAST LINE" in body, body[:200]
+
+
+# ---------- H-51 / M-04: the counts reach the end record ----------
+
+class Scripted(Beekeeper):
+    def __init__(self, arena, task, script, **kw):
+        super().__init__(str(arena), task, **kw)
+        self.script = list(script)
+
+    def request(self):
+        self._request_body()
+        if not self.script:
+            return {"message": {"content": ""}, "finish_reason": "stop"}
+        name, args = self.script.pop(0)
+        return {"message": {"content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}]},
+            "finish_reason": "tool_calls"}
+
+
+def _ends(tmp_path):
+    recs = [json.loads(l) for f in sorted((tmp_path / "spend").glob("*.jsonl"))
+            for l in f.read_text().splitlines() if l.strip()]
+    return [r for r in recs if r.get("kind") == "end"]
+
+
+CLIP_KEYS = {"truncations", "clips"}
+
+
+def test_the_clip_counts_reach_the_end_records_opportunities(arena, tmp_path, monkeypatch):
+    monkeypatch.setenv("BEEKEEPER_TRACEBACK", "on")
+    monkeypatch.setenv("BEEKEEPER_SPEND_DIR", str(tmp_path / "spend"))
+    (arena / "out.txt").write_text("\n".join(["FIRST LINE"] + _noise(400) + ["LAST LINE"]) + "\n")
+    bk = Scripted(arena, "t", [("bash", {"command": "cat out.txt"})])
+    bk.run()
+    o = _ends(tmp_path)[0]["opportunities"]
+    assert CLIP_KEYS <= set(o), sorted(o)
+    assert o["truncations"] == 1 and o["clips"] == 1, o
+
+
+def test_the_truncation_gate_is_counted_with_the_flag_off(arena, tmp_path, monkeypatch):
+    """Zero clips on a run that never overflowed and zero clips on a control
+    arm are the same number until the gate is reported beside them."""
+    monkeypatch.setenv("BEEKEEPER_SPEND_DIR", str(tmp_path / "spend"))
+    (arena / "out.txt").write_text("\n".join(["FIRST LINE"] + _noise(400) + ["LAST LINE"]) + "\n")
+    bk = Scripted(arena, "t", [("bash", {"command": "cat out.txt"}),
+                               ("bash", {"command": "echo small"})])
+    bk.run()
+    o = _ends(tmp_path)[0]["opportunities"]
+    assert CLIP_KEYS <= set(o), sorted(o)
+    assert o["truncations"] == 1, "the gate is counted whatever the policy says"
+    assert o["clips"] == 0, o
