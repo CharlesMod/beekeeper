@@ -467,6 +467,13 @@ class Beekeeper:
         self.net_snapshot = None         # the copy's root, outside the arena; removed at the end
         self.net_thread = None
         self.net_bg = None               # the thread's failing set; None if it could not run
+        self.net_bg_unmeasured = False   # ...and the M-02 case: it ran and collected nothing
+        # H-09c: the baseline is a RECORD, always. Seven runs on pool v2's chain 3
+        # edited under net=on/bg with no net record at all, because every one of
+        # `_net_baseline`'s early returns is silent — and a lever with no record
+        # reads as a lever with no effect.
+        self.net_baseline_recorded = False
+        self.net_unmeasured = False      # the baseline ran and measured nothing (M-02)
         # H-32, the auto-verify: after every successful edit or write the harness
         # runs the verify itself and the result is the next observation — progress
         # becomes visible without the model asking. Off by default.
@@ -664,6 +671,8 @@ class Beekeeper:
         self.assert_base = self._assert_count()
         if net_baseline is not None:
             self.net_baseline = set(net_baseline)   # a restart carries the baseline measured before the FIRST edit
+            self._net_record(failing=len(self.net_baseline), names=sorted(self.net_baseline)[:40],
+                             carried=True)
         if verify_cmd and start_verify:
             code, out0 = self._run_verify()
             self._observe(code, out0, turn=0)
@@ -1337,6 +1346,13 @@ class Beekeeper:
         return out if seen else None
 
     @staticmethod
+    def _unmeasured(code, out):
+        """M-02: the run proves nothing about the tree — pytest could not
+        collect (4/5), or it says so in words. Not red; not green; unmeasured."""
+        text = str(out or '')
+        return code in (4, 5) or 'no tests ran' in text or 'not found:' in text
+
+    @staticmethod
     def failing_tests(output):
         """Names pytest reports as FAILED or ERROR in its short summary."""
         return set(re.findall(r'^(?:FAILED|ERROR) (\S+\.py::\S+?)(?: - .*)?$', output or '', re.M))
@@ -1357,7 +1373,7 @@ class Beekeeper:
         text = str(out or '')
         # M-02: a red exit is not evidence that tests ran, and the trend and
         # the ladder are as bound by that as the board is
-        if code in (4, 5) or 'no tests ran' in text or 'not found:' in text:
+        if self._unmeasured(code, text):
             return
         if self.trend_policy == 'on':
             self._observe_trend(code, text, turn)
@@ -1513,7 +1529,10 @@ class Beekeeper:
 
         def work():
             try:
-                _, out = self._run_cmd(self.net_cmd, cwd=snap)
+                code, out = self._run_cmd(self.net_cmd, cwd=snap)
+                if self._unmeasured(code, out):
+                    self.net_bg_unmeasured = True     # M-02: not an empty failing set
+                    return
                 self.net_bg = self.failing_tests(out)
             except Exception as e:          # the snapshot is removed under it when a run ends early
                 log(f"[beekeeper] net bg: baseline did not finish ({type(e).__name__}: {e})")
@@ -1521,14 +1540,33 @@ class Beekeeper:
         self.net_thread.start()
         log(f"[beekeeper] net baseline running in the background on a {wall:.1f}s snapshot")
 
+    def _net_record(self, **fields):
+        """H-09c: the one baseline record this run gets, whatever happened.
+        `failing: null` with a `reason` is the honest reading when nothing
+        could be measured — the reading the seven silent runs owed us."""
+        if self.net_baseline_recorded:
+            return
+        self.net_baseline_recorded = True
+        rec = {"kind": "net", "stage": "baseline", "turn": self.turn,
+               "failing": None, "names": [], "pending": False, "policy": self.net_policy}
+        rec.update(fields)
+        self._spend(rec)
+
     def _net_baseline(self):
         """Measured once, before the first edit or write: which tests in the
-        named tests' files fail as the tree stands. Never assumed.
+        named tests' files fail as the tree stands. Never assumed — and, since
+        H-09c, never silent either: every way this can fail to measure leaves
+        a `stage: "baseline"` record naming the reason.
 
         Under `bg` the measurement is already running on the start-of-run
         snapshot: an edit that arrives first WAITS for it — H-09's law is that
         the baseline precedes the first edit — and the wait is a record."""
-        if self.net_cmd is None or self.net_baseline is not None:
+        if self.net_baseline is not None or self.net_unmeasured:
+            return                         # measured (or measured to be unmeasurable) already
+        if self.net_cmd is None:
+            if self.net_policy != 'off':   # off is declared in the end record and owes nothing
+                self.net_unmeasured = True
+                self._net_record(reason=('no_verify_cmd' if not self.verify_cmd else 'no_test_ids'))
             return
         if self.net_thread is not None:
             alive = self.net_thread.is_alive()
@@ -1543,18 +1581,31 @@ class Beekeeper:
                 self.net_baseline = self.net_bg
                 log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
                     + (" (background)" if not alive else f" (background, {waited:.1f}s waited)"))
-                self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
-                             "names": sorted(self.net_baseline)[:40], "bg": True,
-                             "waited": round(waited, 2)})
+                self._net_record(failing=len(self.net_baseline),
+                                 names=sorted(self.net_baseline)[:40], bg=True,
+                                 waited=round(waited, 2))
+                return
+            if self.net_bg_unmeasured:
+                # M-02: the snapshot run collected nothing. Re-running it here would
+                # buy the same non-answer at the model's expense.
+                self.net_unmeasured = True
+                log("[beekeeper] net baseline: the background run measured nothing (M-02) — no baseline")
+                self._net_record(reason='unmeasured', bg=True, waited=round(waited, 2))
                 return
             log("[beekeeper] net bg: no background result — measuring synchronously")
         code, out = self._run_cmd(self.net_cmd)
+        if self._unmeasured(code, out):
+            # M-02: exit 4/5 or "no tests ran" is not an empty failing set. A
+            # baseline of zero here made every red sibling a regression at done.
+            self.net_unmeasured = True
+            log(f"[beekeeper] net baseline: the net command measured nothing (exit {code}) — no baseline")
+            self._net_record(reason='unmeasured', code=code)
+            return
         self.net_baseline = self.failing_tests(out)
         self.net_baselines += 1
         log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
             + (": " + ", ".join(sorted(self.net_baseline))[:300] if self.net_baseline else ""))
-        self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
-                     "names": sorted(self.net_baseline)[:40]})
+        self._net_record(failing=len(self.net_baseline), names=sorted(self.net_baseline)[:40])
 
     # ---------- H-33 / H-15: alternation, no progress, the wander ----------
     def _verify_outcome(self, output):
@@ -1720,11 +1771,21 @@ class Beekeeper:
         if self.net_cmd:
             self.net_gate_reached += 1
             self._net_baseline()
+            if self.net_baseline is None:
+                # M-02: with no baseline there is nothing to call a regression.
+                # Judging anyway is what turned an uncollectable net run into
+                # "done refused — regression" for tests never observed to pass.
+                log("[beekeeper] net gate: no baseline was measured — the net cannot judge this done")
+                self._spend({"kind": "net", "stage": "done", "baseline": None,
+                             "reason": "no baseline", "judged": False})
+                return None
             ncode, nout = self._run_cmd(self.net_cmd)
             now = self.failing_tests(nout)
             regressions = sorted(now - (self.net_baseline or set()))
             siblings = sorted(now & (self.net_baseline or set()))
-            self._spend({"kind": "net", "stage": "done", "failing": len(now), "regressions": regressions[:40],
+            self._spend({"kind": "net", "stage": "done", "failing": len(now),
+                         "baseline": len(self.net_baseline), "judged": True,
+                         "regressions": regressions[:40],
                          "siblings": siblings[:40], "override": self.net_override})
             if regressions:
                 self.net_refusals += 1
@@ -2127,11 +2188,28 @@ class Beekeeper:
                 "truncations": self.truncations,
                 "clips": self.clips}
 
+    def _net_end_record(self):
+        """H-09c: a run that ended before anything asked for a baseline still
+        says so. Under `bg` that reads "not landed" — which is a measurement of
+        the instrument — where silence read "not attempted"."""
+        if self.net_baseline_recorded or self.net_policy == 'off':
+            return
+        if self.net_bg is not None:      # it landed; no edit and no done ever spent it
+            self._net_record(failing=len(self.net_bg), names=sorted(self.net_bg)[:40],
+                             bg=True, used=False)
+        elif self.net_bg_unmeasured:
+            self._net_record(reason='unmeasured', bg=True)
+        elif self.net_thread is not None:
+            self._net_record(reason='background baseline did not land', pending=True, bg=True)
+        else:
+            self._net_record(reason='not_reached')
+
     def _end(self, reason, rc):
         self.end_reason = reason
         if self.spend_turn:
             self._spend(self.spend_turn); self.spend_turn = {}
         self._close_create_offer()       # a live offer is recorded before the end record
+        self._net_end_record()           # ...and so is the baseline, measured or not
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
