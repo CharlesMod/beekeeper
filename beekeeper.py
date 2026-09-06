@@ -1430,6 +1430,7 @@ class Beekeeper:
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
                      "think_policy": self.think_policy,
+                     "net_policy": self.net_policy,      # the ring check reads it: net=off owes no baseline
                      # M-04: effects beside their opportunities, in every arm
                      "phase_policy": self.phase_policy, "phase_k": self.phase_k,
                      "first_edit_turn": self.first_edit_turn, "forced_edit": self.forced_edit,
