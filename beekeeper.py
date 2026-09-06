@@ -34,6 +34,7 @@ SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
+CREATE_OFFER_TURNS = 3  # H-56: turns a create offer stays in the schema before it expires
 RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
 RESTART_FLOOR_S = 60  # never restart into less than this many seconds
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
@@ -235,6 +236,15 @@ class Beekeeper:
                 self.board_rows.setdefault(f"{m.group(3)}::{m.group(4)}", ('?', 0))
         self.restart_policy = os.environ.get('BEEKEEPER_RESTART', '').strip().lower() or 'off'
         self.restart_source = 'env' if os.environ.get('BEEKEEPER_RESTART', '').strip() else 'default'
+        # H-56, missing file -> create: an output that names an import of a path
+        # this arena does not have puts a `create` tool for exactly that path in
+        # the NEXT turn's schema — an affordance, not a sentence. Off by default;
+        # with it off nothing is scanned and the run is byte-identical.
+        self.create_policy = os.environ.get('BEEKEEPER_CREATE', '').strip().lower() or 'off'
+        self.create_source = 'env' if os.environ.get('BEEKEEPER_CREATE', '').strip() else 'default'
+        self.create_offer = None         # {turn, targets, paths, taken, noted}: one live offer
+        self.create_offers = 0           # missing paths seen
+        self.create_taken = 0            # files created through the offer
         self.end_reason = None
         self.net_baseline = None           # names failing in those files before the first edit
         self.net_override = False          # a second done accepts pre-existing siblings
@@ -286,13 +296,14 @@ class Beekeeper:
         if verify_cmd and start_verify:
             code, out0 = self._run_verify()
             self._observe(code, out0, turn=0)
+            self._scan_missing(out0, 0)
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
         log(f"[beekeeper] settings: budget={budget}({self.budget_source}) think={self.think_policy}({self.think_source}) "
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -500,6 +511,188 @@ class Beekeeper:
         self.ledger.append(f"write {os.path.basename(p)} ({len(content)} chars)")
         return (note or '') + f"OK: wrote {len(content)} chars"
 
+    def t_create(self, file_path, content):
+        """H-56: a `write` restricted to the paths the harness derived from a
+        real import failure. Any other path is refused — the offer names what
+        is missing, and naming it is the whole point."""
+        if not self._create_live():
+            return fail('args', "unknown tool create")
+        paths = self.create_offer["paths"]
+        p, _ = self._inside(file_path)
+        rel = os.path.relpath(p, self.arena) if p else str(file_path)
+        if rel not in paths:
+            return fail('blocked', "create writes only the missing paths this harness named: "
+                                   + ", ".join(paths) + f" — {file_path} is not one of them. "
+                                   "Use write for any other file.")
+        d = os.path.dirname(os.path.join(self.arena, rel))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        out = self.t_write(rel, content)
+        if str(out).startswith('ERROR'):
+            return out
+        if self.ledger and self.ledger[-1].startswith('write '):
+            self.ledger[-1] = f"create {rel} ({len(content)} chars)"
+        self.create_taken += 1
+        self.create_offer["taken"] = True
+        return f"OK: created {rel} — {len(content)} chars"
+
+    # ---------- H-56: the paths an output says are missing ----------
+    # A missing NAME in a module that exists is deliberately its own regex: the
+    # module is there, the symbol is not, and that is an edit, never a create.
+    _MOD_RE = re.compile(r"""No module named ['"]?([A-Za-z_][\w.]*)""")
+    _NAME_RE = re.compile(r"""cannot import name ['"]([A-Za-z_]\w*)['"] from ['"]?([A-Za-z_][\w.]*)""")
+    _FNF_RE = re.compile(r"""FileNotFoundError[^\n]*?['"]([^'"\n]+)['"]""")
+
+    @staticmethod
+    def _module_paths(dotted):
+        rel = dotted.replace('.', '/')
+        return [rel + '.py', rel + '/__init__.py']
+
+    def _present(self, rel):
+        return os.path.exists(os.path.join(self.arena, rel))
+
+    def _imported_by_a_test(self, name):
+        pat = re.compile(r'(?m)^\s*(?:from|import)\s+' + re.escape(name) + r'\b')
+        n = 0
+        for root, dirs, files in os.walk(self.arena):
+            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', '.venv', 'node_modules')]
+            for f in files:
+                if not f.endswith('.py') or not (f.startswith('test_') or f.endswith('_test.py')
+                                                 or os.path.basename(root) == 'tests'):
+                    continue
+                n += 1
+                if n > 400:
+                    return False
+                try:
+                    if pat.search(open(os.path.join(root, f), errors='replace').read()):
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    def _declared_dependency(self, head):
+        key = head.replace('_', '-').lower()
+        for f in ('requirements.txt', 'requirements-dev.txt', 'pyproject.toml',
+                  'setup.py', 'setup.cfg', 'Pipfile'):
+            p = os.path.join(self.arena, f)
+            if not os.path.exists(p):
+                continue
+            try:
+                body = open(p, errors='replace').read().replace('_', '-').lower()
+            except OSError:
+                continue
+            if re.search(r"""(?m)(^|[\s"'\[=,>])""" + re.escape(key) + r"""($|[\s"'\]=<>~!,;])""", body):
+                return True
+        return False
+
+    def _create_rooted(self, dotted):
+        """A candidate is the arena's to write only when the import is ROOTED
+        here: the top package already exists in the tree, or a bare name is
+        imported by one of the arena's own tests and named by no dependency
+        manifest. A missing third-party package is a dependency, not a file to
+        invent — writing `numpy.py` into the tree would shadow the real fix."""
+        head = dotted.split('.')[0]
+        if os.path.isdir(os.path.join(self.arena, head)) or self._present(head + '.py'):
+            return True
+        if '.' in dotted:
+            return False
+        return self._imported_by_a_test(head) and not self._declared_dependency(head)
+
+    def _file_candidate(self, raw):
+        raw = str(raw).strip()
+        if not raw or raw.startswith('~'):
+            return None
+        q = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(self.arena, raw))
+        if not q.startswith(self.arena + os.sep) or os.path.exists(q):
+            return None
+        rel = os.path.relpath(q, self.arena)
+        if not os.path.splitext(rel)[1] and os.sep not in rel:
+            return None      # a bare token is a program that is not installed, not a file to write
+        return rel
+
+    def _scan_missing(self, out, turn):
+        """Read a verify's or a bash call's output for imports of paths that
+        are not in this arena and open ONE offer over the candidates."""
+        if self.create_policy != 'on' or not out:
+            return
+        text = str(out)
+        targets, seen = [], set()
+
+        def add(group):
+            # a module's two candidates are ALTERNATIVES: if either is already
+            # in the tree the module is present and the fault is inside it
+            if not group or any(self._present(p) for p in group):
+                return
+            key = tuple(group)
+            if key not in seen:
+                seen.add(key)
+                targets.append(group)
+
+        for name, module in self._NAME_RE.findall(text):
+            if any(self._present(p) for p in self._module_paths(module)):
+                # the module IS there; the symbol is not. Recorded, never offered.
+                self._spend({"kind": "create_skip", "turn": turn, "reason": "name-not-path",
+                             "module": module, "name": name})
+                continue
+            if self._create_rooted(module):
+                add(self._module_paths(module))
+        for module in self._MOD_RE.findall(text):
+            if self._create_rooted(module):
+                add(self._module_paths(module))
+        for raw in self._FNF_RE.findall(text):
+            c = self._file_candidate(raw)
+            if c:
+                add([c])
+        if not targets:
+            return
+        self._close_create_offer()          # one live offer at a time
+        paths = [p for g in targets for p in g]
+        self.create_offer = {"turn": turn, "targets": targets, "paths": paths,
+                             "taken": False, "noted": False}
+        self.create_offers += 1
+        log(f"[beekeeper] create offered (t{turn}): {', '.join(paths)}")
+
+    def _create_live(self):
+        o = self.create_offer
+        return (self.create_policy == 'on' and bool(o)
+                and (self.turn - o["turn"]) <= CREATE_OFFER_TURNS)
+
+    def _close_create_offer(self):
+        o = self.create_offer
+        if not o:
+            return
+        self.create_offer = None
+        self._spend({"kind": "create", "turn": o["turn"], "offered": o["paths"], "taken": o["taken"]})
+
+    def _offer_create(self, turn):
+        """The offer lives until the path exists or three turns pass; the note
+        naming the candidates is written once, when the offer first reaches a
+        schema."""
+        o = self.create_offer
+        if self.create_policy != 'on' or not o:
+            return
+        if all(any(self._present(p) for p in g) for g in o["targets"]) or turn - o["turn"] > CREATE_OFFER_TURNS:
+            self._close_create_offer()
+            return
+        if not o["noted"]:
+            o["noted"] = True
+            self.messages.append({"role": "user", "content":
+                "[create offered: the last output names " + ", ".join(o["paths"])
+                + " — paths this arena does not have. The `create` tool writes exactly one of "
+                  "them and refuses any other path.]"})
+
+    def _create_tool(self):
+        paths = list(self.create_offer["paths"])
+        return {"type": "function", "function": {
+            "name": "create",
+            "description": ("Create a file the last output showed as imported but ABSENT from this "
+                            "arena: " + ", ".join(paths) + ". Only those paths; any other is refused "
+                            "(use write or edit for files that already exist)."),
+            "parameters": {"type": "object", "properties": {
+                "file_path": {"type": "string", "enum": paths},
+                "content": {"type": "string"}},
+                "required": ["file_path", "content"]}}}
+
     def t_bash(self, command):
         sig = norm_sig(command)
         if self.poison.get(sig, 0) >= 2:
@@ -693,6 +886,7 @@ class Beekeeper:
         if self.verify_cmd:
             code, out = self._run_verify()
             self._observe(code, out, self.turn)
+            self._scan_missing(out, self.turn)
             if code != 0:
                 return fail('blocked', f"done refused — verify exited {code}. The work is not done:\n{out}")
         if self.net_cmd:
@@ -766,9 +960,10 @@ class Beekeeper:
         withheld = self.withheld - {'done'}
         if self.withhold_policy == 'turn':
             self.withheld = set()        # consumed by this build: one turn only (arm D)
+        base = (TOOLS + [self._create_tool()]) if self._create_live() else TOOLS
         if not withheld:
-            return TOOLS
-        return [t for t in TOOLS if t["function"]["name"] not in withheld]
+            return base
+        return [t for t in base if t["function"]["name"] not in withheld]
 
     def _spend(self, rec):
         if not self.spend_path:
@@ -890,10 +1085,12 @@ class Beekeeper:
         self.end_reason = reason
         if self.spend_turn:
             self._spend(self.spend_turn); self.spend_turn = {}
+        self._close_create_offer()       # a live offer is recorded before the end record
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
-                     "think_policy": self.think_policy})
+                     "think_policy": self.think_policy,
+                     "create_offers": self.create_offers, "create_taken": self.create_taken})
         return rc
 
     def run(self, max_seconds=None):
@@ -919,6 +1116,7 @@ class Beekeeper:
                 log(f"[beekeeper t{turn}] think={'on' if think else 'off'}"
                     + (f" budget={self.think_budget()}" if think else ""))
             if self.board_policy == 'on': self._render_board(turn)
+            self._offer_create(turn)
             if self._size() > self.hard_limit: self.compact(hard=True)
             elif self._size() > self.compact_at: self.compact()
             t_req = time.time()
@@ -997,7 +1195,7 @@ class Beekeeper:
                     self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": refusal})
                     continue
                 sig = norm_sig(f"{name} {brief}")
-                if name in ('edit', 'write'):
+                if name in ('edit', 'write', 'create'):
                     # an edit's identity is its content, not its path: two
                     # different edits to one file are a search, not a loop
                     sig += "@" + hashlib.sha1(json.dumps(
@@ -1062,7 +1260,9 @@ class Beekeeper:
                     self.spend_turn["failing"] = self.failing_count(str(result))
                     if not self.last_verify_red:
                         self.edits_since_green = 0
-                changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
+                if name == 'bash':
+                    self._scan_missing(str(result), turn)
+                changed_world = name in ('edit', 'write', 'create') and not str(result).startswith('ERROR')
                 if changed_world:
                     self.edits_since_green += 1
                 if changed_world and self.exhausted:
