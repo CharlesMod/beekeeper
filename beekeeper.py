@@ -57,6 +57,25 @@ DISCIPLINE — follow strictly:
 6. FINISH. Complete the task's submission step, then call done. done is gated on real verification — it will refuse if the work is not actually done.
 7. WHEN THE HARNESS REFUSES, IT NAMES A REAL RULE. Read the refusal; it is never noise."""
 
+# H-07 (M-09): the rules a guard already enforces are deleted, because this
+# model class reads the shape of its context and not the list of rules —
+# "ONE READ EACH" was violated sixty times in one run while it was in view,
+# and the read cache ended it. Each of the seven has code behind it: 1 the
+# start verify and the phase gate, 2 the numeric-literal gate, 3 the nudge
+# counter and prose salvage, 4 the read cache / collapse / stall law, 5's
+# verify half the done gate (and auto-verify), 6's gate the done gate, 7 the
+# refusal texts themselves. What survives is what no guard enforces: the
+# task's own self-check and submission step. The tools, the verify command
+# and the exit-code law stay because they are FACTS about the world, which
+# is the one instructional form M-09 keeps.
+LEAN = """You are beekeeper, a terse repair agent. You fix broken code.
+
+Tools: {tools}.
+Verify: {verify}
+When it is green, follow the task's self-check and submission steps exactly \
+— run what they say and read the output — then call done. done re-runs the \
+verify and refuses unless it exits 0. Exit codes decide, never your summary."""
+
 TOOLS = [
     {"type": "function", "function": {"name": "read", "description": "Read a file (numbered lines; long files show head+tail).",
      "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
@@ -91,6 +110,20 @@ if SEARCH_URL:
              "limit": {"type": "integer", "description": "max results (default 6)"}},
              "required": ["query"]}}})
 REGISTRY = {t['function']['name'] for t in TOOLS}
+
+def system_prompt(policy, verify_cmd=None):
+    """The system message. `full` (the default) is byte-identical to SYSTEM."""
+    if policy != 'lean':
+        return SYSTEM
+    return LEAN.format(tools=', '.join(t['function']['name'] for t in TOOLS),
+                       verify=verify_cmd or '(none — the task names its own check)')
+
+
+def arena_anchor(policy, arena, task):
+    """The arena line keeps the FACT and, under lean, drops the RULE: the
+    scope fence blocks (and often corrects) an out-of-arena path already."""
+    rule = '' if policy == 'lean' else ' Use relative paths; never leave it.'
+    return f"[Arena root: {arena} — your bash commands run there.{rule}]\n\n{task}"
 
 def log(msg): print(msg, flush=True)
 
@@ -313,6 +346,12 @@ class Beekeeper:
         # this arena does not have puts a `create` tool for exactly that path in
         # the NEXT turn's schema — an affordance, not a sentence. Off by default;
         # with it off nothing is scanned and the run is byte-identical.
+        # H-07: `lean` deletes every rule a guard enforces; `full` (default) is
+        # today's prompt, byte for byte. An unknown word is full — the prompt
+        # is never a variant nobody named.
+        _rules = os.environ.get('BEEKEEPER_RULES', '').strip().lower()
+        self.rules_policy = _rules if _rules in ('full', 'lean') else 'full'
+        self.rules_source = 'env' if _rules in ('full', 'lean') else 'default'
         self.create_policy = os.environ.get('BEEKEEPER_CREATE', '').strip().lower() or 'off'
         self.create_source = 'env' if os.environ.get('BEEKEEPER_CREATE', '').strip() else 'default'
         self.create_offer = None         # {turn, targets, paths, taken, noted}: one live offer
@@ -363,9 +402,8 @@ class Beekeeper:
         self.last_think = (0, 0, None)       # (budget, used, closed) of the latest thinking turn
         self.compactions = 0
         self.pin_idx = set()             # message indices compaction must never evict
-        anchored = (f"[Arena root: {self.arena} — your bash commands run there. "
-                    f"Use relative paths; never leave it.]\n\n{task}")
-        self.messages = [{"role": "system", "content": SYSTEM},
+        anchored = arena_anchor(self.rules_policy, self.arena, task)
+        self.messages = [{"role": "system", "content": system_prompt(self.rules_policy, verify_cmd)},
                          {"role": "user", "content": anchored}]
         self.pin_idx.update({0, 1})
         self.snapshot = self._tree_hash()
@@ -391,6 +429,7 @@ class Beekeeper:
             f"alt={self.alt_policy}({self.alt_source}) alt_edits={self.alt_edits} "
             f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} "
             f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) max_turns={MAX_TURNS} "
+            f"rules={self.rules_policy}({self.rules_source}) "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -1432,6 +1471,10 @@ class Beekeeper:
                      "think_policy": self.think_policy,
                      "net_policy": self.net_policy,      # the ring check reads it: net=off owes no baseline
                      # M-04: effects beside their opportunities, in every arm
+                     # H-07: the arm's own instrument, measured (chars/2.5), not inferred
+                     "rules_policy": self.rules_policy,
+                     "prompt_tokens_est": round(sum(len(self.messages[i]["content"])
+                                                    for i in (0, 1)) / 2.5),
                      "phase_policy": self.phase_policy, "phase_k": self.phase_k,
                      "first_edit_turn": self.first_edit_turn, "forced_edit": self.forced_edit,
                      "forced_turns": self.forced_turns, "red_after_edit": self.red_after_edit,
