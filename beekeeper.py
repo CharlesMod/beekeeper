@@ -10,7 +10,7 @@ Third-generation harness, bred from three of its author's systems:
 Doctrine: the harness moves the model; the model never settles its own claims;
 the system never lies to the model; a refusal names the real rule.
 """
-import argparse, hashlib, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
+import argparse, ast, hashlib, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
 import urllib.request, urllib.error, urllib.parse
 
 def _cfg():
@@ -44,6 +44,9 @@ PHASE_K = 6         # H-10: the turn by which the first edit is forced (the ring
 AUTOVERIFY_MAX_S = 90  # H-32: a verify this slow is not spent unasked (docker verifies cost 20-90 s)
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
 THINK_CEILING = 4096  # BEEKEEPER_THINK_CEILING: never ask for more thinking than this in one turn
+SYMBOLMAP_CHARS = 9000   # H-04: BEEKEEPER_SYMBOLMAP_CHARS — over this a read serves the map
+SYMBOLMAP_MAX = 1200     # H-04: the map's own character cap (~1 KB); extras fold into a count
+SYMBOLMAP_RANGE_LINES = 400   # H-04: the most lines one ranged read may return
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
 
 SYSTEM = """You are beekeeper, a terse repair agent. You fix broken machines (code) with the fewest, most causal moves.
@@ -91,12 +94,120 @@ if SEARCH_URL:
              "limit": {"type": "integer", "description": "max results (default 6)"}},
              "required": ["query"]}}})
 REGISTRY = {t['function']['name'] for t in TOOLS}
+# H-04: the read schema the model sees when BEEKEEPER_SYMBOLMAP=on. A separate
+# constant, never a mutation of TOOLS — a flag-off worker in the same process
+# must see the shipped schema unchanged.
+RANGED_READ = {"type": "function", "function": {"name": "read",
+    "description": ("Read a file (numbered lines). A big file returns its SYMBOL MAP — defs and "
+                    "classes with line ranges — not its text; then read the range you need with "
+                    "start_line/end_line, which returns exactly those lines."),
+    "parameters": {"type": "object", "properties": {
+        "file_path": {"type": "string"},
+        "start_line": {"type": "integer", "description": "first line to return (1-based, inclusive)"},
+        "end_line": {"type": "integer", "description": "last line to return (inclusive)"}},
+        "required": ["file_path"]}}}
 
 def log(msg): print(msg, flush=True)
 
 def fail(kind, msg):
     assert kind in FAIL_KINDS
     return f"ERROR[{kind}]: {msg}"
+
+# ---------- H-04: the symbol map ----------
+# A read of a 306 KB file used to answer "what is in here?" with its first 150
+# and last 40 lines — the two places the symbol being hunted is not. The map is
+# the file's shape at ~1 KB, and it names the call that fetches the body: a
+# range. Structural, not instructional (harness-review.md): the affordance
+# changes, no rule is added.
+SYM_RE = re.compile(
+    r'^(?P<indent>[ \t]*)'
+    r'(?:(?:export|public|private|protected|internal|static|final|abstract|async|pub|def|declare)\s+)*'
+    r'(?:'
+    r'(?P<kind>class|struct|interface|enum|trait|impl|module|def|func|fn|function|type)\s+'
+    r'(?P<name>[A-Za-z_$][\w$]*)'
+    r'|func\s+\([^)]*\)\s*(?P<name4>[A-Za-z_][\w]*)'      # go methods
+    r'|(?:const|let|var)\s+(?P<name2>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?'
+    r'(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)'
+    r')')
+
+def _ast_rows(text):
+    """(depth, label, start, end) for Python that parses. Nothing else is as
+    honest about a class's line range as the compiler's own numbers."""
+    tree = ast.parse(text)
+    rows, fn = [], (ast.FunctionDef, ast.AsyncFunctionDef)
+    for node in tree.body:
+        end = getattr(node, 'end_lineno', node.lineno) or node.lineno
+        if isinstance(node, fn):
+            rows.append((0, f"def {node.name}", node.lineno, end))
+        elif isinstance(node, ast.ClassDef):
+            rows.append((0, f"class {node.name}", node.lineno, end))
+            for sub in node.body:
+                if isinstance(sub, fn):
+                    rows.append((1, f"def {sub.name}", sub.lineno,
+                                 getattr(sub, 'end_lineno', sub.lineno) or sub.lineno))
+    return rows
+
+def _regex_rows(text):
+    """Every other language, and Python the compiler refuses — a file that will
+    not parse is exactly when the model most needs to see its shape."""
+    lines, hits = text.splitlines(), []
+    for i, l in enumerate(lines):
+        m = SYM_RE.match(l)
+        if not m:
+            continue
+        name = m.group('name') or m.group('name4') or m.group('name2')
+        kind = m.group('kind') or ('func' if m.group('name4') else 'const')
+        depth = 0 if not m.group('indent') else 1
+        hits.append((depth, f"{kind} {name}", i + 1))
+    rows = []
+    for n, (depth, label, start) in enumerate(hits):
+        nxt = next((s for _, _, s in hits[n + 1:]), len(lines) + 1)
+        rows.append((depth, label, start, max(start, nxt - 1)))
+    return rows
+
+def symbol_map(path, text, cap=SYMBOLMAP_MAX):
+    """The map, or None when the file has no shape worth showing (data, prose:
+    a map of nothing is worse than the two ends)."""
+    try:
+        rows = _ast_rows(text) if path.endswith('.py') else _regex_rows(text)
+    except (SyntaxError, ValueError, RecursionError):
+        rows = _regex_rows(text)
+    if len(rows) < 2:
+        return None
+    lines = text.splitlines()
+    head = (f"{os.path.basename(path)} · {len(lines)} lines · {len(text)} chars · symbol map "
+            f"(the body is NOT shown — read what you need with "
+            f"read(file_path, start_line=A, end_line=B))")
+    render = lambda r: f"{r[2]:>6}-{r[3]:<6} " + ("  " if r[0] else "") + r[1]
+    room = cap - len(head) - 40                     # 40 holds the fold note
+    # Top level first — the file's outline survives even when its methods cannot.
+    # When the outline itself will not fit, it is SAMPLED across the file, never
+    # truncated: a map that stops three quarters of the way down is the head-only
+    # serve this lever exists to replace.
+    cost = lambda idx: len(render(rows[idx])) + 1
+    tops = [i for i, r in enumerate(rows) if r[0] == 0]
+    chosen = tops
+    if sum(cost(i) for i in tops) > room:
+        chosen = []
+        for k in range(len(tops), 0, -1):
+            pick = ([tops[round(i * (len(tops) - 1) / (k - 1))] for i in range(k)]
+                    if k > 1 else [tops[0]])
+            pick = sorted(set(pick))
+            if sum(cost(i) for i in pick) <= room:
+                chosen = pick
+                break
+    used = sum(cost(i) for i in chosen)
+    chosen = list(chosen)
+    for idx, r in enumerate(rows):        # members in file order fill what is left
+        if r[0] != 0:
+            if used + cost(idx) > room:
+                break
+            chosen.append(idx); used += cost(idx)
+    keep = sorted(chosen)
+    out = [head] + [render(rows[i]) for i in keep]
+    if len(keep) < len(rows):
+        out.append(f"… +{len(rows) - len(keep)} more symbols not shown")
+    return "\n".join(out)
 
 def auto_verify(arena):
     """Detect the arena's own check. Verification is the DEFAULT posture."""
@@ -318,6 +429,17 @@ class Beekeeper:
         self.create_offer = None         # {turn, targets, paths, taken, noted}: one live offer
         self.create_offers = 0           # H-51: the gate — missing paths seen
         self.create_taken = 0            # H-51: the act — files created through the offer
+        # H-04, the symbol map: over the threshold a read serves the file's SHAPE
+        # (defs, classes, line ranges) and the schema grows start_line/end_line, so
+        # the next call fetches the body it actually wants. Off by default: with it
+        # off the read tool's schema, its output and its refusals are unchanged.
+        self.symbolmap_policy = os.environ.get('BEEKEEPER_SYMBOLMAP', '').strip().lower() or 'off'
+        self.symbolmap_source = 'env' if os.environ.get('BEEKEEPER_SYMBOLMAP', '').strip() else 'default'
+        self.symbolmap_chars = int(os.environ.get('BEEKEEPER_SYMBOLMAP_CHARS') or SYMBOLMAP_CHARS)
+        self.symbolmap_chars_source = 'env' if os.environ.get('BEEKEEPER_SYMBOLMAP_CHARS') else 'default'
+        self.mapped = set()              # paths whose last serve was a map, not a body
+        self.maps_served = 0             # H-51 opportunity counts: big reads answered with a map
+        self.ranged_reads = 0            # …and ranges the model then asked for
         # H-51 (M-04): every lever's OPPORTUNITY count, kept where the lever acts
         self.attempt = 1                 # run_attempts overwrites it; restarts = attempt - 1
         self.exhaustion_events = 0       # actions the stall law exhausted
@@ -390,7 +512,9 @@ class Beekeeper:
             f"phase={self.phase_policy}({self.phase_source}) phase_k={self.phase_k}({self.phase_k_source}) "
             f"alt={self.alt_policy}({self.alt_source}) alt_edits={self.alt_edits} "
             f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) "
+            f"symbolmap={self.symbolmap_policy}({self.symbolmap_source}) symbolmap_chars={self.symbolmap_chars}({self.symbolmap_chars_source}) "
+            f"max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -474,18 +598,54 @@ class Beekeeper:
             return hits[0], f"[path corrected to {rel} — the path you gave pointed outside the arena] "
         return None, None
 
-    def t_read(self, file_path):
+    def t_read(self, file_path, start_line=None, end_line=None):
+        ranged = start_line is not None or end_line is not None
+        if ranged and self.symbolmap_policy != 'on':
+            return fail('args', "read takes only file_path")
         p, note = self._inside(file_path)
         if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         try: body = open(p, errors='replace').read()
         except OSError as e: return fail('args', str(e))
+        lines = body.splitlines()
+        if ranged:
+            # A range is a DIFFERENT view of the file, so the unchanged-cache never
+            # blocks it: having been shown the map, the model must be able to fetch
+            # what the map named. The repeat is the stall law's business, not this
+            # tool's — an identical range thrice is exhausted like any other action.
+            try:
+                a = int(start_line if start_line is not None else 1)
+                b = int(end_line if end_line is not None else a)
+            except (TypeError, ValueError):
+                return fail('args', "start_line and end_line must be whole numbers")
+            if a < 1 or b < a:
+                return fail('args', f"bad range {a}-{b}: 1 <= start_line <= end_line")
+            if a > len(lines):
+                return fail('args', f"{file_path} has {len(lines)} lines; start_line {a} is past the end")
+            capped = min(b, len(lines), a + SYMBOLMAP_RANGE_LINES - 1)
+            self.last_full_read = p          # eviction un-caches this path like any read
+            self.ranged_reads += 1
+            out = '\n'.join(f"{i}|{lines[i - 1]}" for i in range(a, capped + 1))
+            if capped < min(b, len(lines)):
+                out += (f"\n... [stopped at line {capped}: one read returns at most "
+                        f"{SYMBOLMAP_RANGE_LINES} lines — ask for the next range]")
+            return (note or '') + out
         sha = hashlib.sha1(body.encode()).hexdigest()
         self.last_full_read = None
         if self.read_cache.get(p) == sha:
+            if self.symbolmap_policy == 'on' and p in self.mapped:
+                return ("[unchanged since your last read — what you have is this file's symbol map, "
+                        "not its body. Read the lines you need: "
+                        "read(file_path, start_line=A, end_line=B).]")
             return "[unchanged since your last read — you already have this file in context]"
         self.read_cache[p] = sha
         self.last_full_read = p
-        lines = body.splitlines()
+        if self.symbolmap_policy == 'on' and len(body) > self.symbolmap_chars:
+            m = symbol_map(p, body, SYMBOLMAP_MAX)
+            if m:                            # a file with no shape keeps head+tail
+                self.mapped.add(p)
+                self.maps_served += 1
+                return m
+        self.mapped.discard(p)
         if len(body) > 9000:
             shown = lines[:150] + [f"... [{len(lines) - 190} lines omitted — use edit for targeted changes] ..."] + lines[-40:]
         else:
@@ -1239,6 +1399,8 @@ class Beekeeper:
         if withheld:
             self.withheld_turns += 1
         base = (TOOLS + [self._create_tool()]) if self._create_live() else TOOLS
+        if self.symbolmap_policy == 'on':      # H-04: a new list; TOOLS is never mutated
+            base = [RANGED_READ if t["function"]["name"] == 'read' else t for t in base]
         if not withheld:
             return base
         return [t for t in base if t["function"]["name"] not in withheld]
