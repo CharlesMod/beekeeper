@@ -37,6 +37,7 @@ STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (e
 ALT_PERIODS = (2, 3)  # H-33: the cycle lengths the alternation detector reads (period 1 IS the stall law)
 ALT_DETOUR = 2      # H-15: unrelated actions between two refusals that do NOT reset the streak
 ALT_EDITS = 3       # H-33: successive edits with an unchanged verify outcome before edit is withheld
+CREATE_OFFER_TURNS = 3  # H-56: turns a create offer stays in the schema before it expires
 RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
 RESTART_FLOOR_S = 60  # never restart into less than this many seconds
 PHASE_K = 6         # H-10: the turn by which the first edit is forced (the ring's winners edit by turn 6)
@@ -308,6 +309,22 @@ class Beekeeper:
         self.alternations = 0            # M-04 opportunity counts: reported whether the flag is on or off
         self.no_progress_events = 0
         self.wanders = 0
+        # H-56, missing file -> create: an output that names an import of a path
+        # this arena does not have puts a `create` tool for exactly that path in
+        # the NEXT turn's schema — an affordance, not a sentence. Off by default;
+        # with it off nothing is scanned and the run is byte-identical.
+        self.create_policy = os.environ.get('BEEKEEPER_CREATE', '').strip().lower() or 'off'
+        self.create_source = 'env' if os.environ.get('BEEKEEPER_CREATE', '').strip() else 'default'
+        self.create_offer = None         # {turn, targets, paths, taken, noted}: one live offer
+        self.create_offers = 0           # H-51: the gate — missing paths seen
+        self.create_taken = 0            # H-51: the act — files created through the offer
+        # H-51 (M-04): every lever's OPPORTUNITY count, kept where the lever acts
+        self.attempt = 1                 # run_attempts overwrites it; restarts = attempt - 1
+        self.exhaustion_events = 0       # actions the stall law exhausted
+        self.withheld_turns = 0          # turns whose schema was short a tool
+        self.net_baselines = 0           # baselines the net actually measured
+        self.net_gate_reached = 0        # times done reached the net's judgment
+        self.net_refusals = 0            # times the net refused a done
         self.end_reason = None
         self.net_baseline = None           # names failing in those files before the first edit
         self.net_override = False          # a second done accepts pre-existing siblings
@@ -360,6 +377,7 @@ class Beekeeper:
             code, out0 = self._run_verify()
             self._observe(code, out0, turn=0)
             self.last_outcome = self._verify_outcome(out0)   # the tree as it stands: no-progress reads from here
+            self._scan_missing(out0, 0)
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
         if self.net_policy == 'bg' and self.net_cmd and self.net_baseline is None:
@@ -371,7 +389,8 @@ class Beekeeper:
             f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) "
             f"phase={self.phase_policy}({self.phase_source}) phase_k={self.phase_k}({self.phase_k_source}) "
             f"alt={self.alt_policy}({self.alt_source}) alt_edits={self.alt_edits} "
-            f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} max_turns={MAX_TURNS} "
+            f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -578,6 +597,188 @@ class Beekeeper:
         self.read_cache.pop(p, None)
         self.ledger.append(f"write {os.path.basename(p)} ({len(content)} chars)")
         return (note or '') + f"OK: wrote {len(content)} chars"
+
+    def t_create(self, file_path, content):
+        """H-56: a `write` restricted to the paths the harness derived from a
+        real import failure. Any other path is refused — the offer names what
+        is missing, and naming it is the whole point."""
+        if not self._create_live():
+            return fail('args', "unknown tool create")
+        paths = self.create_offer["paths"]
+        p, _ = self._inside(file_path)
+        rel = os.path.relpath(p, self.arena) if p else str(file_path)
+        if rel not in paths:
+            return fail('blocked', "create writes only the missing paths this harness named: "
+                                   + ", ".join(paths) + f" — {file_path} is not one of them. "
+                                   "Use write for any other file.")
+        d = os.path.dirname(os.path.join(self.arena, rel))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        out = self.t_write(rel, content)
+        if str(out).startswith('ERROR'):
+            return out
+        if self.ledger and self.ledger[-1].startswith('write '):
+            self.ledger[-1] = f"create {rel} ({len(content)} chars)"
+        self.create_taken += 1
+        self.create_offer["taken"] = True
+        return f"OK: created {rel} — {len(content)} chars"
+
+    # ---------- H-56: the paths an output says are missing ----------
+    # A missing NAME in a module that exists is deliberately its own regex: the
+    # module is there, the symbol is not, and that is an edit, never a create.
+    _MOD_RE = re.compile(r"""No module named ['"]?([A-Za-z_][\w.]*)""")
+    _NAME_RE = re.compile(r"""cannot import name ['"]([A-Za-z_]\w*)['"] from ['"]?([A-Za-z_][\w.]*)""")
+    _FNF_RE = re.compile(r"""FileNotFoundError[^\n]*?['"]([^'"\n]+)['"]""")
+
+    @staticmethod
+    def _module_paths(dotted):
+        rel = dotted.replace('.', '/')
+        return [rel + '.py', rel + '/__init__.py']
+
+    def _present(self, rel):
+        return os.path.exists(os.path.join(self.arena, rel))
+
+    def _imported_by_a_test(self, name):
+        pat = re.compile(r'(?m)^\s*(?:from|import)\s+' + re.escape(name) + r'\b')
+        n = 0
+        for root, dirs, files in os.walk(self.arena):
+            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', '.venv', 'node_modules')]
+            for f in files:
+                if not f.endswith('.py') or not (f.startswith('test_') or f.endswith('_test.py')
+                                                 or os.path.basename(root) == 'tests'):
+                    continue
+                n += 1
+                if n > 400:
+                    return False
+                try:
+                    if pat.search(open(os.path.join(root, f), errors='replace').read()):
+                        return True
+                except OSError:
+                    pass
+        return False
+
+    def _declared_dependency(self, head):
+        key = head.replace('_', '-').lower()
+        for f in ('requirements.txt', 'requirements-dev.txt', 'pyproject.toml',
+                  'setup.py', 'setup.cfg', 'Pipfile'):
+            p = os.path.join(self.arena, f)
+            if not os.path.exists(p):
+                continue
+            try:
+                body = open(p, errors='replace').read().replace('_', '-').lower()
+            except OSError:
+                continue
+            if re.search(r"""(?m)(^|[\s"'\[=,>])""" + re.escape(key) + r"""($|[\s"'\]=<>~!,;])""", body):
+                return True
+        return False
+
+    def _create_rooted(self, dotted):
+        """A candidate is the arena's to write only when the import is ROOTED
+        here: the top package already exists in the tree, or a bare name is
+        imported by one of the arena's own tests and named by no dependency
+        manifest. A missing third-party package is a dependency, not a file to
+        invent — writing `numpy.py` into the tree would shadow the real fix."""
+        head = dotted.split('.')[0]
+        if os.path.isdir(os.path.join(self.arena, head)) or self._present(head + '.py'):
+            return True
+        if '.' in dotted:
+            return False
+        return self._imported_by_a_test(head) and not self._declared_dependency(head)
+
+    def _file_candidate(self, raw):
+        raw = str(raw).strip()
+        if not raw or raw.startswith('~'):
+            return None
+        q = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(self.arena, raw))
+        if not q.startswith(self.arena + os.sep) or os.path.exists(q):
+            return None
+        rel = os.path.relpath(q, self.arena)
+        if not os.path.splitext(rel)[1] and os.sep not in rel:
+            return None      # a bare token is a program that is not installed, not a file to write
+        return rel
+
+    def _scan_missing(self, out, turn):
+        """Read a verify's or a bash call's output for imports of paths that
+        are not in this arena and open ONE offer over the candidates."""
+        if self.create_policy != 'on' or not out:
+            return
+        text = str(out)
+        targets, seen = [], set()
+
+        def add(group):
+            # a module's two candidates are ALTERNATIVES: if either is already
+            # in the tree the module is present and the fault is inside it
+            if not group or any(self._present(p) for p in group):
+                return
+            key = tuple(group)
+            if key not in seen:
+                seen.add(key)
+                targets.append(group)
+
+        for name, module in self._NAME_RE.findall(text):
+            if any(self._present(p) for p in self._module_paths(module)):
+                # the module IS there; the symbol is not. Recorded, never offered.
+                self._spend({"kind": "create_skip", "turn": turn, "reason": "name-not-path",
+                             "module": module, "name": name})
+                continue
+            if self._create_rooted(module):
+                add(self._module_paths(module))
+        for module in self._MOD_RE.findall(text):
+            if self._create_rooted(module):
+                add(self._module_paths(module))
+        for raw in self._FNF_RE.findall(text):
+            c = self._file_candidate(raw)
+            if c:
+                add([c])
+        if not targets:
+            return
+        self._close_create_offer()          # one live offer at a time
+        paths = [p for g in targets for p in g]
+        self.create_offer = {"turn": turn, "targets": targets, "paths": paths,
+                             "taken": False, "noted": False}
+        self.create_offers += 1
+        log(f"[beekeeper] create offered (t{turn}): {', '.join(paths)}")
+
+    def _create_live(self):
+        o = self.create_offer
+        return (self.create_policy == 'on' and bool(o)
+                and (self.turn - o["turn"]) <= CREATE_OFFER_TURNS)
+
+    def _close_create_offer(self):
+        o = self.create_offer
+        if not o:
+            return
+        self.create_offer = None
+        self._spend({"kind": "create", "turn": o["turn"], "offered": o["paths"], "taken": o["taken"]})
+
+    def _offer_create(self, turn):
+        """The offer lives until the path exists or three turns pass; the note
+        naming the candidates is written once, when the offer first reaches a
+        schema."""
+        o = self.create_offer
+        if self.create_policy != 'on' or not o:
+            return
+        if all(any(self._present(p) for p in g) for g in o["targets"]) or turn - o["turn"] > CREATE_OFFER_TURNS:
+            self._close_create_offer()
+            return
+        if not o["noted"]:
+            o["noted"] = True
+            self.messages.append({"role": "user", "content":
+                "[create offered: the last output names " + ", ".join(o["paths"])
+                + " — paths this arena does not have. The `create` tool writes exactly one of "
+                  "them and refuses any other path.]"})
+
+    def _create_tool(self):
+        paths = list(self.create_offer["paths"])
+        return {"type": "function", "function": {
+            "name": "create",
+            "description": ("Create a file the last output showed as imported but ABSENT from this "
+                            "arena: " + ", ".join(paths) + ". Only those paths; any other is refused "
+                            "(use write or edit for files that already exist)."),
+            "parameters": {"type": "object", "properties": {
+                "file_path": {"type": "string", "enum": paths},
+                "content": {"type": "string"}},
+                "required": ["file_path", "content"]}}}
 
     def t_bash(self, command):
         sig = norm_sig(command)
@@ -801,6 +1002,7 @@ class Beekeeper:
             log("[beekeeper] net bg: no background result — measuring synchronously")
         code, out = self._run_cmd(self.net_cmd)
         self.net_baseline = self.failing_tests(out)
+        self.net_baselines += 1
         log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
             + (": " + ", ".join(sorted(self.net_baseline))[:300] if self.net_baseline else ""))
         self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
@@ -957,9 +1159,11 @@ class Beekeeper:
         if self.verify_cmd:
             code, out = self._run_verify()
             self._observe(code, out, self.turn)
+            self._scan_missing(out, self.turn)
             if code != 0:
                 return fail('blocked', f"done refused — verify exited {code}. The work is not done:\n{out}")
         if self.net_cmd:
+            self.net_gate_reached += 1
             self._net_baseline()
             ncode, nout = self._run_cmd(self.net_cmd)
             now = self.failing_tests(nout)
@@ -968,11 +1172,13 @@ class Beekeeper:
             self._spend({"kind": "net", "stage": "done", "failing": len(now), "regressions": regressions[:40],
                          "siblings": siblings[:40], "override": self.net_override})
             if regressions:
+                self.net_refusals += 1
                 return fail('blocked', "done refused — regression: tests in the files your tests live in "
                                        f"passed before your edits and fail now: {', '.join(regressions)[:400]}\n"
                                        f"{nout[-1200:]}")
             if siblings and not self.net_override:
                 self.net_override = True
+                self.net_refusals += 1
                 return fail('blocked', "done refused ONCE — the named tests pass, but tests in the same files "
                                        f"still fail ({len(siblings)}): {', '.join(siblings)[:400]}. They failed "
                                        "before you started, so they may be part of this issue. Fix them if "
@@ -1030,9 +1236,12 @@ class Beekeeper:
         withheld = (self.withheld | self.phase_withheld) - {'done'}
         if self.withhold_policy == 'turn':
             self.withheld = set()        # consumed by this build: one turn only (arm D)
+        if withheld:
+            self.withheld_turns += 1
+        base = (TOOLS + [self._create_tool()]) if self._create_live() else TOOLS
         if not withheld:
-            return TOOLS
-        return [t for t in TOOLS if t["function"]["name"] not in withheld]
+            return base
+        return [t for t in base if t["function"]["name"] not in withheld]
 
     def _phase_gate(self, turn):
         """H-10. Decide, once per turn, which tools the phase keeps out of the
@@ -1182,10 +1391,41 @@ class Beekeeper:
                 log(f"[beekeeper] stream died ({str(e)[:100]}) — resurrecting")
         return None
 
+    def opportunities(self):
+        """H-51 (instrument-law.md M-04): one documented place where every
+        lever's OPPORTUNITY count sits beside what it did. A lever that acts at
+        a gate is `unmeasured` when the gate was never reached — the net was
+        called inert on pool v2 after firing in 0 of 28 runs, and only a
+        hand-count of the transcripts showed no run had ever reached `done`
+        green. Zero here is a measurement; an absent block is not.
+
+            restart   stalls                             / restarts
+            withhold  exhaustions, refusals              / withheld_turns
+            board     board_rows                         / board_flips
+            net       net_baselines, net_gate_reached    / net_refusals
+            think     turns                              / think_turns
+            create    create_offers                      / create_taken
+        """
+        return {"turns": self.turn,
+                "stalls": int(self.end_reason == "stalled"),
+                "restarts": max(0, int(getattr(self, "attempt", 1)) - 1),
+                "exhaustions": self.exhaustion_events,
+                "refusals": sum(self.refused_count.values()),
+                "withheld_turns": self.withheld_turns,
+                "board_rows": len(self.board_rows),
+                "board_flips": len(self.board_flips),
+                "net_baselines": self.net_baselines,
+                "net_gate_reached": self.net_gate_reached,
+                "net_refusals": self.net_refusals,
+                "think_turns": sum(1 for _, t in self.think_log if t),
+                "create_offers": self.create_offers,
+                "create_taken": self.create_taken}
+
     def _end(self, reason, rc):
         self.end_reason = reason
         if self.spend_turn:
             self._spend(self.spend_turn); self.spend_turn = {}
+        self._close_create_offer()       # a live offer is recorded before the end record
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
@@ -1202,7 +1442,9 @@ class Beekeeper:
                      # M-04: opportunities, not only effects — a lever that never
                      # had a gate to act at is unmeasured, never inert
                      "autoverifies": self.autoverifies,
-                     "autoverify_skipped": self.autoverify_skipped})
+                     "autoverify_skipped": self.autoverify_skipped,
+                     "create_offers": self.create_offers, "create_taken": self.create_taken,
+                     "opportunities": self.opportunities()})
         if self.net_snapshot:
             # the background baseline is a daemon thread: it dies with the process,
             # and the copy does not outlive the run either way
@@ -1234,6 +1476,7 @@ class Beekeeper:
                     + (f" budget={self.think_budget()}" if think else ""))
             if self.board_policy == 'on': self._render_board(turn)
             self._phase_gate(turn)
+            self._offer_create(turn)
             if self._size() > self.hard_limit: self.compact(hard=True)
             elif self._size() > self.compact_at: self.compact()
             t_req = time.time()
@@ -1312,7 +1555,7 @@ class Beekeeper:
                     self.messages.append({"role": "tool", "tool_call_id": tc.get('id', ''), "content": refusal})
                     continue
                 sig = norm_sig(f"{name} {brief}")
-                if name in ('edit', 'write'):
+                if name in ('edit', 'write', 'create'):
                     # an edit's identity is its content, not its path: two
                     # different edits to one file are a search, not a loop
                     sig += "@" + hashlib.sha1(json.dumps(
@@ -1420,6 +1663,9 @@ class Beekeeper:
                             and self.stall_refusals >= STALL_LIMIT:
                         self.alt_stall = "edits that never moved the verify"
                 changed_world = progress
+                if name == 'bash':
+                    self._scan_missing(str(result), turn)
+                changed_world = name in ('edit', 'write', 'create') and not str(result).startswith('ERROR')
                 if changed_world:
                     self.edits_since_green += 1
                     self.edits_since_verify += 1
@@ -1455,6 +1701,7 @@ class Beekeeper:
                     # forever. Repetition itself is the signal.
                     if n >= 3:
                         repeated = True
+                        self.exhaustion_events += 1
                         self.exhausted[sig] = n
                         self.exhausted_idx[sig] = self.last_result_idx
                         self.withheld.add(name)
