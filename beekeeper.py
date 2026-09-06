@@ -36,6 +36,7 @@ NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
 RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
 RESTART_FLOOR_S = 60  # never restart into less than this many seconds
+AUTOVERIFY_MAX_S = 90  # H-32: a verify this slow is not spent unasked (docker verifies cost 20-90 s)
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
 THINK_CEILING = 4096  # BEEKEEPER_THINK_CEILING: never ask for more thinking than this in one turn
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
@@ -226,6 +227,17 @@ class Beekeeper:
         self.net_policy = os.environ.get('BEEKEEPER_NET', '').strip().lower() or 'on'
         self.net_source = 'env' if os.environ.get('BEEKEEPER_NET', '').strip() else 'default'
         self.net_cmd = self._net_cmd(verify_cmd) if (verify_cmd and self.net_policy != 'off') else None
+        # H-32, the auto-verify: after every successful edit or write the harness
+        # runs the verify itself and the result is the next observation — progress
+        # becomes visible without the model asking. Off by default.
+        self.autoverify_policy = os.environ.get('BEEKEEPER_AUTOVERIFY', '').strip().lower() or 'off'
+        self.autoverify_source = 'env' if os.environ.get('BEEKEEPER_AUTOVERIFY', '').strip() else 'default'
+        self.autoverify_max_s = float(os.environ.get('BEEKEEPER_AUTOVERIFY_MAX_S') or AUTOVERIFY_MAX_S)
+        self.autoverifies = 0            # M-04: opportunity counts, reported whether the lever fired or not
+        self.autoverify_skipped = 0
+        self.autoverify_turn = None      # the turn the decision was last taken (at most one a turn)
+        self.autoverify_notes = set()    # skip reasons already said once (a repeated note is an attractor)
+        self.last_verify_wall = None     # what the harness's own verify costs, measured not assumed
         self.board_policy = os.environ.get('BEEKEEPER_BOARD', '').strip().lower() or 'off'
         self.board_source = 'env' if os.environ.get('BEEKEEPER_BOARD', '').strip() else 'default'
         self.board_rows = {}            # test id -> (state, turn): red | green | '?'; flipped by verification alone
@@ -292,7 +304,8 @@ class Beekeeper:
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) "
+            f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -678,12 +691,74 @@ class Beekeeper:
                      "names": sorted(self.net_baseline)[:40]})
 
     def _run_verify(self):
+        """The gate's own check. Its wall is recorded: what the harness may
+        spend unasked (H-32) is decided from what the last one actually cost,
+        never from an assumption."""
+        t = time.time()
         try:
             r = subprocess.run(self.verify_cmd, shell=True, cwd=self.arena, capture_output=True,
                                text=True, timeout=120, stdin=subprocess.DEVNULL)
-            return r.returncode, (r.stdout + r.stderr)[-1500:]
+            out = (r.stdout + r.stderr)[-1500:]
+            code = r.returncode
         except subprocess.TimeoutExpired:
-            return 124, "verify timed out"
+            code, out = 124, "verify timed out"
+        self.last_verify_wall = time.time() - t
+        return code, out
+
+    def _autoverify(self, turn):
+        """H-32: the harness verifies after an edit and the result is the next
+        observation — the model sees what its edit did without having asked.
+
+        Budgeted, because a verify is not free: at most one decision a turn
+        (and so never twice without an edit between, since only a successful
+        edit or write calls this), never when the last verify cost more than
+        the budget, never when the clock cannot afford another one. A skip is
+        one line, said once per reason — a note repeated every turn is the
+        attractor the stall law exists to break.
+
+        Downstream, it IS a verify: the board, `last_verify_red`,
+        `edits_since_green`, the phase and the turn's spend record all read it
+        exactly as they read one the model ran. The stall law is the one law
+        that must NOT see it: the harness's observation is not the model's
+        action, so it takes no signature, exhausts nothing and withholds
+        nothing."""
+        if self.autoverify_policy != 'on' or not self.verify_cmd or self.autoverify_turn == turn:
+            return
+        self.autoverify_turn = turn
+        why = None
+        if self.last_verify_wall is not None and self.last_verify_wall > self.autoverify_max_s:
+            why = (f"the last verify took {self.last_verify_wall:.0f}s, over the "
+                   f"{self.autoverify_max_s:g}s budget")
+        elif self.max_seconds is not None and (self.max_seconds - (time.time() - self.t0)) < self.autoverify_max_s:
+            why = f"under {self.autoverify_max_s:g}s left on the clock"
+        if why:
+            self.autoverify_skipped += 1
+            log(f"[beekeeper t{turn}] auto-verify skipped: {why}")
+            if why not in self.autoverify_notes:
+                self.autoverify_notes.add(why)
+                self.messages.append({"role": "user", "content":
+                                      f"[auto-verify skipped — {why}; the harness did not run the verify this turn.]"})
+            return
+        code, out = self._run_verify()
+        wall = self.last_verify_wall or 0.0
+        failing = self.failing_count(out)
+        self.autoverifies += 1
+        self._observe(code, out, turn)
+        self.after_verify = True
+        self.last_verify_red = code != 0
+        if not self.last_verify_red:
+            self.edits_since_green = 0
+        self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
+        self.spend_turn["failing"] = failing
+        self._spend({"kind": "autoverify", "turn": turn, "code": code,
+                     "failing": failing, "wall": round(wall, 2)})
+        head = f"exit {code}" + (f" · {failing} failing" if failing is not None else "")
+        body = (f"[auto-verify — the harness ran the verify command itself after your edit; "
+                f"you did not ask for this and it did not cost you a turn]\n{head}\n{str(out)[-1200:]}")
+        idx = len(self.messages)
+        self.messages.append({"role": "tool", "tool_call_id": f"autoverify-t{turn}", "content": body})
+        self._pin_red(idx, body)
+        log(f"[beekeeper t{turn}] auto-verify: {head} ({wall:.1f}s)")
 
     def t_done(self, summary):
         v = self.tamper_violations()
@@ -893,7 +968,11 @@ class Beekeeper:
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
-                     "think_policy": self.think_policy})
+                     "think_policy": self.think_policy,
+                     # M-04: opportunities, not only effects — a lever that never
+                     # had a gate to act at is unmeasured, never inert
+                     "autoverifies": self.autoverifies,
+                     "autoverify_skipped": self.autoverify_skipped})
         return rc
 
     def run(self, max_seconds=None):
@@ -1119,6 +1198,8 @@ class Beekeeper:
                 self._pin_red(idx, str(result))
                 if name == 'read' and self.last_full_read:
                     self.read_msgs[idx] = self.last_full_read
+                if changed_world:
+                    self._autoverify(turn)      # H-32: the edit's result, unasked
                 # the harness moves the model (eiDOS): forced pivot on a closed path
                 ok = not str(result).startswith('ERROR')
                 self.sig_history.append((sig, ok))
