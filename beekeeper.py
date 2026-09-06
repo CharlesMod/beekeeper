@@ -10,7 +10,7 @@ Third-generation harness, bred from three of its author's systems:
 Doctrine: the harness moves the model; the model never settles its own claims;
 the system never lies to the model; a refusal names the real rule.
 """
-import argparse, ast, hashlib, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
+import argparse, ast, difflib, hashlib, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
 import urllib.request, urllib.error, urllib.parse
 
 def _cfg():
@@ -58,6 +58,8 @@ def named_files(text):
     return out
 PHASE_K = 6         # H-10: the turn by which the first edit is forced (the ring's winners edit by turn 6)
 AUTOVERIFY_MAX_S = 90  # H-32: a verify this slow is not spent unasked (docker verifies cost 20-90 s)
+EDIT_NEAR_MISS = 0.7   # H-34: similarity may only SAY WHERE TO LOOK; it never picks a block to edit
+EDIT_NEAR_MISS_LINES = 3000  # ...and it is not paid for on a file this big
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
 THINK_CEILING = 4096  # BEEKEEPER_THINK_CEILING: never ask for more thinking than this in one turn
 SYMBOLMAP_CHARS = 9000   # H-04: BEEKEEPER_SYMBOLMAP_CHARS — over this a read serves the map
@@ -537,6 +539,22 @@ class Beekeeper:
         self.red_after_edit = 0          # red verifies that followed an edit: the gate's opportunities
         self.edit_withheld_after_red = 0 # ...of which this many took edit out of the schema
         self.edits_since_verify = 0
+        # H-34, the edit repair ladder. MEASURED first (2026-09-06, pool v2's
+        # seven finished arms): 254 edit calls, 111 applied, 76 `old_str not
+        # found` — 30% of every edit call refused, 18-42% per arm, 0 ambiguous.
+        # Edits are this harness's scarce commitment (294 edit turns against
+        # 5,640 bash and 1,820 read; the phase gate lifts tasks-that-edit-at-all
+        # from 13/28 to 24/28), so a refused edit is not one wasted call, it is
+        # one of the run's few commitments thrown away. None of it reached the
+        # ledger: a `fail('args', "old_str not found")` is not a refusal and was
+        # recorded nowhere. The FIELDS below are measured under both settings —
+        # measuring is not a lever — and only the ladder rides the flag.
+        self.edit_repair_policy = os.environ.get('BEEKEEPER_EDIT_REPAIR', '').strip().lower() or 'off'
+        self.edit_repair_source = 'env' if os.environ.get('BEEKEEPER_EDIT_REPAIR', '').strip() else 'default'
+        self.edit_calls = 0              # M-04: the gate — every edit the model asked for
+        self.edit_repairs = 0            # ...of which this many needed a normalisation to apply
+        self.edit_failures = 0           # ...and this many applied nothing at all
+        self.last_edit_record = None     # {applied, repair, fail_class} of the latest edit or write
         # H-33 / H-15: the stall law is a PERIOD-1 detector — it compares a
         # result with the one immediately before it — so two actions taken in
         # turns never trip it (pool v2's remaining stalls), and a single
@@ -669,6 +687,7 @@ class Beekeeper:
             f"rules={self.rules_policy}({self.rules_source}) "
             f"symbolmap={self.symbolmap_policy}({self.symbolmap_source}) symbolmap_chars={self.symbolmap_chars}({self.symbolmap_chars_source}) "
             f"traceback={self.traceback_policy}({self.traceback_source}) "
+            f"edit_repair={self.edit_repair_policy}({self.edit_repair_source}) "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -833,22 +852,20 @@ class Beekeeper:
             open(p, 'wb').write(before)
             return fail('parse', f"edit produced a syntax error (line {e.lineno}: {e.msg}) — rolled back")
 
-    def _edit_grace(self, s, old_str, new_str):
-        """Small models paraphrase whitespace and copy the N| display prefixes from read
-        output. If the content still identifies a unique block, grace the edit with a note."""
-        o = re.sub(r'(?m)^\s*\d+\|', '', old_str)
-        w = re.sub(r'(?m)^\s*\d+\|', '', new_str)
-        if o != old_str and s.count(o) == 1:
-            return o, w, "[line-number prefixes stripped — the N| in read output is display, not file content] "
+    def _match_block(self, s, o, w, norm):
+        """One rung of the ladder: an EXACT match of the file's own lines after
+        a declared normalisation. A unique hit returns the file's bytes to
+        replace, new_str re-indented to the matched block, and the note; a
+        block that matches nowhere, or in more than one place, returns None."""
         flines, olines = s.split('\n'), o.split('\n')
-        tgt = [l.strip() for l in olines]
-        if not any(tgt): return None, None, None
+        tgt = [norm(l) for l in olines]
+        if not any(tgt): return None
         hits = [i for i in range(len(flines) - len(olines) + 1)
-                if [l.strip() for l in flines[i:i + len(olines)]] == tgt]
-        if len(hits) != 1: return None, None, None
+                if [norm(l) for l in flines[i:i + len(olines)]] == tgt]
+        if len(hits) != 1: return None
         i = hits[0]
         exact = '\n'.join(flines[i:i + len(olines)])
-        if s.count(exact) != 1: return None, None, None
+        if s.count(exact) != 1: return None
         shift = (len(flines[i]) - len(flines[i].lstrip())) - (len(olines[0]) - len(olines[0].lstrip()))
         nlines = w.split('\n')
         if shift > 0:
@@ -857,26 +874,111 @@ class Beekeeper:
             nlines = [l[min(-shift, len(l) - len(l.lstrip())):] if l.strip() else l for l in nlines]
         return exact, '\n'.join(nlines), "[old_str matched by content with corrected whitespace] "
 
+    # H-34: the rungs, in order. Every one is an exact match after a DECLARED
+    # normalisation, and the ladder stops at the first UNIQUE hit — the class
+    # names which normalisation the model needed, which is the measurement.
+    _LADDER = (('ws', lambda l: l.rstrip()),                        # trailing whitespace only
+               ('indent', lambda l: l.strip()),                     # leading indentation too
+               ('inner-ws', lambda l: re.sub(r'\s+', ' ', l.strip())))   # runs of whitespace inside
+
+    def _edit_repair(self, s, old_str, new_str):
+        """Small models paraphrase whitespace and copy the N| display prefixes from read
+        output. If the content still identifies a unique block, grace the edit with a note.
+
+        Flag off, this is the pre-H-34 worker byte for byte: the N| strip, then
+        the one whitespace-corrected content match (`indent`). BEEKEEPER_EDIT_REPAIR=on
+        adds the rungs either side of it and the single-line fragment. Nothing
+        here scores similarity: an edit applied to the wrong block is worse
+        than a refusal, and the only thing a score is trusted with is the hint.
+        """
+        o = re.sub(r'(?m)^\s*\d+\|', '', old_str)
+        w = re.sub(r'(?m)^\s*\d+\|', '', new_str)
+        if o != old_str and s.count(o) == 1:
+            return (o, w, "[line-number prefixes stripped — the N| in read output is display, "
+                          "not file content] ", 'prefix')
+        on = self.edit_repair_policy == 'on'
+        for klass, norm in (self._LADDER if on else self._LADDER[1:2]):
+            hit = self._match_block(s, o, w, norm)
+            if hit: return hit + (klass,)
+        if on:
+            # a single-line old_str the model padded: unique as an exact
+            # substring once stripped, so the replacement is unambiguous
+            frag = o.strip()
+            if frag and frag != o and '\n' not in frag and s.count(frag) == 1:
+                return frag, w.strip(), "[old_str matched as a unique single-line fragment] ", 'line'
+        return None, None, None, None
+
+    def _near_miss_hint(self, p, s, old_str):
+        """Similarity may say WHERE to look; it may never pick the block to
+        edit. EXACTLY ONE near-miss earns one line naming its range — zero or
+        several earn nothing, because 'the closest of several' is precisely
+        the guess this refuses to make."""
+        if self.edit_repair_policy != 'on': return ''
+        o = re.sub(r'(?m)^\s*\d+\|', '', old_str)
+        flines, olines = s.split('\n'), o.split('\n')
+        n = len(olines)
+        tgt = '\n'.join(l.strip() for l in olines)
+        if not tgt.strip() or n > len(flines) or len(flines) > EDIT_NEAR_MISS_LINES:
+            return ''
+        hits = []
+        for i in range(len(flines) - n + 1):
+            m = difflib.SequenceMatcher(None, tgt, '\n'.join(l.strip() for l in flines[i:i + n]))
+            if m.real_quick_ratio() < EDIT_NEAR_MISS or m.quick_ratio() < EDIT_NEAR_MISS:
+                continue
+            if m.ratio() >= EDIT_NEAR_MISS:
+                hits.append(i)
+                if len(hits) > 1: return ''
+        if len(hits) != 1: return ''
+        return (f" [the closest block in {os.path.relpath(p, self.arena)} is "
+                f"lines {hits[0] + 1}-{hits[0] + n} — re-read exactly those lines]")
+
+    def _edit_record(self, applied, repair='none', fail_class='none'):
+        """H-34: the apply-failure rate, in the ledger instead of in a grep of
+        the transcripts. Recorded under BOTH flag settings — measuring is not
+        the lever — on every `edit` and `write` turn; the turn's own `action`
+        tells the two apart, and only `edit` feeds the opportunity counts."""
+        rec = {"applied": applied, "repair": repair, "fail_class": fail_class}
+        self.last_edit_record = rec
+        if self.spend_turn:
+            self.spend_turn.update(rec)
+        return rec
+
     def t_edit(self, file_path, old_str, new_str):
+        self.edit_calls += 1
         p, note = self._inside(file_path)
-        if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
+        if not p:
+            self.edit_failures += 1
+            self._edit_record(False, fail_class='outside')
+            return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         try: s = open(p).read()
-        except OSError as e: return fail('args', str(e))
+        except OSError as e:
+            self.edit_failures += 1
+            self._edit_record(False, fail_class='args')
+            return fail('args', str(e))
+        repair = 'none'
         n = s.count(old_str)
         if n == 0:
-            g_old, g_new, g_note = self._edit_grace(s, old_str, new_str)
+            g_old, g_new, g_note, g_class = self._edit_repair(s, old_str, new_str)
             if g_old is not None:
-                old_str, new_str, note = g_old, g_new, (note or '') + g_note
+                old_str, new_str, note, repair = g_old, g_new, (note or '') + g_note, g_class
                 n = s.count(old_str)
-        if n == 0: return fail('args', "old_str not found — copy the exact lines from a fresh read, "
-                                       "without the N| line-number prefixes")
-        if n > 1: return fail('args', f"old_str occurs {n} times; add context to make it unique")
+        if n == 0:
+            self.edit_failures += 1
+            self._edit_record(False, fail_class='not_found')
+            return fail('args', "old_str not found — copy the exact lines from a fresh read, "
+                                "without the N| line-number prefixes" + self._near_miss_hint(p, s, old_str))
+        if n > 1:
+            self.edit_failures += 1
+            self._edit_record(False, repair=repair, fail_class='ambiguous')
+            return fail('args', f"old_str occurs {n} times; add context to make it unique")
         # anti-Goodhart gate: an edit that ONLY changes numbers is usually tuning, not fixing.
         # Refused once; re-issuing the identical edit applies it (constants ARE sometimes wrong).
         numeric_only = old_str != new_str and re.sub(r'[\d.]+', '#', old_str) == re.sub(r'[\d.]+', '#', new_str)
         override_key = (p, old_str, new_str)
         if numeric_only and override_key not in self.override_pending:
             self.override_pending.add(override_key)
+            self.edit_failures += 1
+            self._edit_record(False, repair=repair, fail_class='numeric_only')
             return fail('blocked', "this edit changes ONLY numeric literals. Retuning a constant to "
                                    "satisfy a test is the wrong fix — find the wrong OPERATION "
                                    "(sign, comparison, name), not the constant. If the constant itself "
@@ -888,11 +990,17 @@ class Beekeeper:
         prev_mtime = os.stat(p).st_mtime
         open(p, 'w').write(s.replace(old_str, new_str))
         err = self._syntax_guard(p, before)
-        if err: return err
+        if err:
+            self.edit_failures += 1
+            self._edit_record(False, repair=repair, fail_class='parse')
+            return err
         self._freshen(p, prev_mtime)
         self.read_cache.pop(p, None)
         self.read_evicted.pop(p, None)
         self.last_edit_path = p          # H-05: the working set's second half
+        if repair != 'none':
+            self.edit_repairs += 1
+        self._edit_record(True, repair=repair)
         tag = " [numeric-only, applied on override]" if numeric_only else ""
         self.ledger.append(f"edit {os.path.basename(p)}: {old_str.strip()[:50]!r} -> {new_str.strip()[:50]!r}{tag}")
         if numeric_only:
@@ -904,10 +1012,13 @@ class Beekeeper:
     def t_write(self, file_path, content):
         self._net_baseline()
         p, note = self._inside(file_path)
-        if not p: return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
+        if not p:
+            self._edit_record(False, fail_class='outside')
+            return fail('blocked', f"{file_path} is outside the arena and nothing in it matches that filename")
         if os.path.exists(p):
             old = open(p, errors='replace').read()
             if old.count('\n') >= 40 and len(content) < len(old) * 0.5:
+                self._edit_record(False, fail_class='shrink')
                 return fail('blocked', "refusing whole-file write that shrinks a large file by >50% — "
                                        "the model tends to emit only the fragment it reasoned about; use edit")
             before = old.encode()
@@ -917,8 +1028,11 @@ class Beekeeper:
         open(p, 'w').write(content)
         if before is not None:
             err = self._syntax_guard(p, before)
-            if err: return err
+            if err:
+                self._edit_record(False, fail_class='parse')
+                return err
             self._freshen(p, prev_mtime)
+        self._edit_record(True)
         self.read_cache.pop(p, None)
         self.read_evicted.pop(p, None)
         self.last_edit_path = p          # H-05 (create routes through write too)
@@ -1976,8 +2090,15 @@ class Beekeeper:
         The auto-verify body's own re-clip is deliberately not counted: the
         output it trims was already trimmed by the verify, and one overflow is
         one gate.
+            edit      edit_calls, edit_failures          / edit_repairs
         """
         return {"turns": self.turn,
+                # H-34: the gate is every edit the model asked for; a repair
+                # that never had a failed match to act on is unmeasured, and a
+                # ladder rung is worth building only against the failure count
+                "edit_calls": self.edit_calls,
+                "edit_repairs": self.edit_repairs,
+                "edit_failures": self.edit_failures,
                 "stalls": int(self.end_reason == "stalled"),
                 "restarts": max(0, int(getattr(self, "attempt", 1)) - 1),
                 "exhaustions": self.exhaustion_events,
