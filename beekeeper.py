@@ -36,6 +36,7 @@ NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
 RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
 RESTART_FLOOR_S = 60  # never restart into less than this many seconds
+PHASE_K = 6         # H-10: the turn by which the first edit is forced (the ring's winners edit by turn 6)
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
 THINK_CEILING = 4096  # BEEKEEPER_THINK_CEILING: never ask for more thinking than this in one turn
 FAIL_KINDS = ('args', 'blocked', 'timeout', 'exec', 'parse', 'network', 'llm')
@@ -235,6 +236,35 @@ class Beekeeper:
                 self.board_rows.setdefault(f"{m.group(3)}::{m.group(4)}", ('?', 0))
         self.restart_policy = os.environ.get('BEEKEEPER_RESTART', '').strip().lower() or 'off'
         self.restart_source = 'env' if os.environ.get('BEEKEEPER_RESTART', '').strip() else 'default'
+        # H-10, the phase law: the SCHEMA carries the phase, so orientation and
+        # commitment are affordances rather than instructions (92 of 125 unsolved
+        # arm-runs never edited a file, in every harness; the winners edit by
+        # turn 6, and a rule the model must obey is text it will not follow).
+        # Turn one carries no edit/write; both enter once a verify has been
+        # OBSERVED (the start verify counts); a red verify that FOLLOWS an edit
+        # takes edit out until a read or bash executes (anchoring on one region
+        # after red is the failure); and turn k with no edit yet takes read and
+        # bash out, so the only actions left are edit, write and done.
+        self.phase_policy = os.environ.get('BEEKEEPER_PHASE', '').strip().lower() or 'off'
+        self.phase_source = 'env' if os.environ.get('BEEKEEPER_PHASE', '').strip() else 'default'
+        self.phase_k = int(os.environ.get('BEEKEEPER_PHASE_K') or PHASE_K)
+        self.phase_k_source = 'env' if os.environ.get('BEEKEEPER_PHASE_K') else 'default'
+        self.phase_withheld = set()      # names the phase keeps out of THIS turn's schema
+        self.phase_state = None          # (withheld, reason) of the last recorded transition
+        self.phase_forcing = False       # the first-edit forcing is in effect this turn
+        self.phase_edit_blocked = False  # a red verify followed an edit; edit is out
+        # a gate on an observation that cannot exist would deadlock the run: with
+        # no verify at all there is nothing to observe, so only turn one is gated
+        self.phase_verified = (verify_cmd is None) or bool(start_verify)
+        # the opportunity counts M-04 needs, measured in EVERY arm (a lever whose
+        # gate was never reached is unmeasured, not inert) — the levers themselves
+        # act only under the flag
+        self.first_edit_turn = None      # the turn the first edit or write LANDED
+        self.forced_edit = False         # ...and it landed while read and bash were withheld
+        self.forced_turns = 0            # turns the forcing was in effect
+        self.red_after_edit = 0          # red verifies that followed an edit: the gate's opportunities
+        self.edit_withheld_after_red = 0 # ...of which this many took edit out of the schema
+        self.edits_since_verify = 0
         self.end_reason = None
         self.net_baseline = None           # names failing in those files before the first edit
         self.net_override = False          # a second done accepts pre-existing siblings
@@ -292,7 +322,8 @@ class Beekeeper:
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) "
+            f"phase={self.phase_policy}({self.phase_source}) phase_k={self.phase_k}({self.phase_k_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -763,12 +794,44 @@ class Beekeeper:
         some action actually executes (arm D: two exhausted actions
         alternating, each withheld one turn, stalled across the pair).
         done always stays."""
-        withheld = self.withheld - {'done'}
+        withheld = (self.withheld | self.phase_withheld) - {'done'}
         if self.withhold_policy == 'turn':
             self.withheld = set()        # consumed by this build: one turn only (arm D)
         if not withheld:
             return TOOLS
         return [t for t in TOOLS if t["function"]["name"] not in withheld]
+
+    def _phase_gate(self, turn):
+        """H-10. Decide, once per turn, which tools the phase keeps out of the
+        schema, and record every transition. The forcing yields when edit and
+        write are themselves withheld: a schema of `done` alone is not a phase,
+        it is a wall."""
+        if self.phase_policy != 'on':
+            return
+        w, reasons = set(), []
+        if turn == 1:
+            w |= {'edit', 'write'}; reasons.append('turn_one')
+        elif not self.phase_verified:
+            w |= {'edit', 'write'}; reasons.append('no_verify_observed')
+        if self.phase_edit_blocked:
+            w.add('edit'); reasons.append('edit_after_red')
+        forcing = (turn >= self.phase_k and self.first_edit_turn is None
+                   and not {'edit', 'write'} <= (w | (self.withheld - {'done'})))
+        if forcing:
+            w |= {'read', 'bash'}; reasons.append('force_first_edit')
+            self.forced_turns += 1
+        self.phase_forcing, self.phase_withheld = forcing, w
+        reason = '+'.join(reasons) or 'open'
+        if (frozenset(w), reason) == self.phase_state:
+            return
+        self.phase_state = (frozenset(w), reason)
+        out = (w | self.withheld) - {'done'}
+        self._spend({"kind": "phase", "turn": turn, "reason": reason,
+                     "schema": [t['function']['name'] for t in TOOLS
+                                if t['function']['name'] not in out]})
+        if forcing:
+            self.messages.append({"role": "user", "content":
+                f"[t{turn}: no edit yet — read and bash are out of the schema until you edit or write.]"})
 
     def _spend(self, rec):
         if not self.spend_path:
@@ -893,7 +956,12 @@ class Beekeeper:
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
-                     "think_policy": self.think_policy})
+                     "think_policy": self.think_policy,
+                     # M-04: effects beside their opportunities, in every arm
+                     "phase_policy": self.phase_policy, "phase_k": self.phase_k,
+                     "first_edit_turn": self.first_edit_turn, "forced_edit": self.forced_edit,
+                     "forced_turns": self.forced_turns, "red_after_edit": self.red_after_edit,
+                     "edit_withheld_after_red": self.edit_withheld_after_red})
         return rc
 
     def run(self, max_seconds=None):
@@ -919,6 +987,7 @@ class Beekeeper:
                 log(f"[beekeeper t{turn}] think={'on' if think else 'off'}"
                     + (f" budget={self.think_budget()}" if think else ""))
             if self.board_policy == 'on': self._render_board(turn)
+            self._phase_gate(turn)
             if self._size() > self.hard_limit: self.compact(hard=True)
             elif self._size() > self.compact_at: self.compact()
             t_req = time.time()
@@ -1049,6 +1118,8 @@ class Beekeeper:
                     result = fail('exec', f"{type(e).__name__}: {e}")
                 self.stall_refusals = 0
                 self.withheld.clear()            # something executed: the schema is whole again
+                if name in ('read', 'bash'):
+                    self.phase_edit_blocked = False   # H-10: a fresh observation re-opens edit
                 cmd = str(args.get('command') or '')
                 is_verify = name == 'bash' and bool(cmd) and (
                     (self.verify_cmd and self.verify_cmd.strip() in cmd) or 'pytest' in cmd or 'docker run' in cmd)
@@ -1060,11 +1131,21 @@ class Beekeeper:
                         self._observe(int(m0.group(1)) if m0 else (1 if self.last_verify_red else 0), str(result), turn)
                     self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
                     self.spend_turn["failing"] = self.failing_count(str(result))
+                    self.phase_verified = True       # H-10: a verify has now been observed
+                    if self.last_verify_red and self.edits_since_verify:
+                        self.red_after_edit += 1     # the gate's opportunity, counted in every arm
+                        if self.phase_policy == 'on':
+                            self.phase_edit_blocked = True
+                            self.edit_withheld_after_red += 1
+                    self.edits_since_verify = 0
                     if not self.last_verify_red:
                         self.edits_since_green = 0
                 changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
                 if changed_world:
                     self.edits_since_green += 1
+                    self.edits_since_verify += 1
+                    if self.first_edit_turn is None:   # a refused or failed edit is not an edit
+                        self.first_edit_turn, self.forced_edit = turn, bool(self.phase_forcing)
                 if changed_world and self.exhausted:
                     self.exhausted.clear()   # the world changed; a re-probe is new information
                 # collapse-with-count (eiDOS): repetition rendered AS repetition —
