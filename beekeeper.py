@@ -34,6 +34,9 @@ SEARCH_URL = _opt('BEEKEEPER_SEARCH_URL', 'BEEKEEPER_SEARCH_URL', '')
 MAX_TURNS = 60
 NUDGE_LIMIT = 3
 STALL_LIMIT = 5     # consecutive refused repeats that end the run as stalled (exit 3)
+ALT_PERIODS = (2, 3)  # H-33: the cycle lengths the alternation detector reads (period 1 IS the stall law)
+ALT_DETOUR = 2      # H-15: unrelated actions between two refusals that do NOT reset the streak
+ALT_EDITS = 3       # H-33: successive edits with an unchanged verify outcome before edit is withheld
 RESTART_LIMIT = 4   # H-12: attempts per run at most (the clock is the real budget)
 RESTART_FLOOR_S = 60  # never restart into less than this many seconds
 THINK_BUDGET = 512  # base thinking budget per thinking turn (BEEKEEPER_THINK_BUDGET); the server's --reasoning-budget is the ceiling
@@ -235,6 +238,27 @@ class Beekeeper:
                 self.board_rows.setdefault(f"{m.group(3)}::{m.group(4)}", ('?', 0))
         self.restart_policy = os.environ.get('BEEKEEPER_RESTART', '').strip().lower() or 'off'
         self.restart_source = 'env' if os.environ.get('BEEKEEPER_RESTART', '').strip() else 'default'
+        # H-33 / H-15: the stall law is a PERIOD-1 detector — it compares a
+        # result with the one immediately before it — so two actions taken in
+        # turns never trip it (pool v2's remaining stalls), and a single
+        # unrelated action between two refusals resets the streak to zero
+        # forever. BEEKEEPER_ALT=on extends the SAME counters (stall_refusals,
+        # exhausted, refused_count) to periods 2 and 3, to a detour of one or
+        # two actions, and to edits that leave the verify exactly where it was.
+        self.alt_policy = os.environ.get('BEEKEEPER_ALT', '').strip().lower() or 'off'
+        self.alt_source = 'env' if os.environ.get('BEEKEEPER_ALT', '').strip() else 'default'
+        self.alt_edits = int(os.environ.get('BEEKEEPER_ALT_EDITS') or ALT_EDITS)
+        self.alt_trail = []              # (sig, sterile) per action; progress clears it
+        self.sig_result = {}             # sig -> the result sha it last returned
+        self.alt_detours = 0             # unrelated actions since the last refusal
+        self.alt_note = None             # one line owed to the model, flushed after the turn's calls
+        self.alt_stall = False           # why the streak hit the limit with no refusal to carry the exit
+        self.flat_edits = 0              # successful edits since the verify outcome last moved
+        self.alt_flat = False            # MEASURED: the last edits moved the verify nowhere
+        self.last_outcome = None         # (failing count, failing names) of the last verify observed
+        self.alternations = 0            # M-04 opportunity counts: reported whether the flag is on or off
+        self.no_progress_events = 0
+        self.wanders = 0
         self.end_reason = None
         self.net_baseline = None           # names failing in those files before the first edit
         self.net_override = False          # a second done accepts pre-existing siblings
@@ -286,13 +310,15 @@ class Beekeeper:
         if verify_cmd and start_verify:
             code, out0 = self._run_verify()
             self._observe(code, out0, turn=0)
+            self.last_outcome = self._verify_outcome(out0)   # the tree as it stands: no-progress reads from here
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
         log(f"[beekeeper] settings: budget={budget}({self.budget_source}) think={self.think_policy}({self.think_source}) "
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
             f"bash_timeout={self.bash_timeout}({self.bash_timeout_source}) "
-            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) max_turns={MAX_TURNS} "
+            f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) "
+            f"alt={self.alt_policy}({self.alt_source}) alt_edits={self.alt_edits} max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -677,6 +703,79 @@ class Beekeeper:
         self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
                      "names": sorted(self.net_baseline)[:40]})
 
+    # ---------- H-33 / H-15: alternation, no progress, the wander ----------
+    def _verify_outcome(self, output):
+        """What a verify MEASURED: the failing count and the failing names.
+        None when it measured nothing (an opaque or uncollected run proves
+        nothing about progress — M-02: unmeasured is not red)."""
+        n = self.failing_count(output)
+        return None if n is None else (n, frozenset(self.failing_tests(output)))
+
+    def _alt_cycle(self):
+        """The smallest period in ALT_PERIODS whose last two repetitions are
+        every one of them sterile — each member of the cycle has now returned
+        its identical result three times, which is the period-1 law's own
+        threshold, read over a cycle instead of over one action. 0 = none."""
+        for p in ALT_PERIODS:
+            tail = self.alt_trail[-2 * p:]
+            sigs = [s for s, _ in tail]
+            if (len(tail) == 2 * p and all(sterile for _, sterile in tail)
+                    and sigs[:p] == sigs[p:] and len(set(sigs)) >= 2):
+                return p
+        return 0
+
+    def _alt_step(self, sig, sterile, progress, turn):
+        """One action on the trail. Progress clears it (the world moved, and
+        progress is never punished). Otherwise a closed cycle counts as ONE
+        refusal streak and exhausts its members, so the next call in the
+        pattern is refused before it runs and the pair ends the run stalled
+        instead of wandering to the cap."""
+        if progress:
+            self.alt_trail.clear()
+            return
+        self.alt_trail.append((sig, sterile))
+        p = self._alt_cycle()
+        if not p:
+            return
+        cycle = [s for s, _ in self.alt_trail[-p:]]
+        self.stall_refusals += 1
+        self.alternations += 1
+        for s in cycle:
+            self.exhausted[s] = max(self.exhausted.get(s, 0),
+                                    sum(1 for t, _ in self.alt_trail if t == s))
+        self._spend({"kind": "alt", "turn": turn, "pattern": "aba", "period": p,
+                     "sigs": cycle, "streak": self.stall_refusals})
+        log(f"[beekeeper t{turn}] alternation: {' / '.join(cycle)} taken in turns with unchanged "
+            f"results — one streak ({self.stall_refusals}/{STALL_LIMIT}), both exhausted")
+
+    def _alt_no_progress(self, output, turn):
+        """H-33's second half: edits that leave the verify exactly where it was
+        are not progress. N of them (BEEKEEPER_ALT_EDITS) withhold `edit` for
+        one turn and say so in one line; a recurrence joins the stall streak."""
+        outcome = self._verify_outcome(output)
+        if outcome is None:
+            return False
+        prev, self.last_outcome = self.last_outcome, outcome
+        if prev is None or outcome != prev:
+            self.flat_edits, self.alt_flat = 0, False   # the verify moved: edits are progress again
+            return False
+        if self.flat_edits < self.alt_edits:
+            return False
+        if self.no_progress_events:
+            self.stall_refusals += 1     # the first withholds; a recurrence counts toward the stall
+        self.no_progress_events += 1
+        n, names = outcome
+        self._spend({"kind": "alt", "turn": turn, "pattern": "no_progress", "edits": self.flat_edits,
+                     "failing": n, "tests": sorted(names)[:20], "withheld": "edit",
+                     "streak": self.stall_refusals})
+        self.alt_note = (f"[no progress: {self.flat_edits} edits and the verify has not moved "
+                         f"({n} failing" + (f": {', '.join(sorted(names))[:200]}" if names else "") +
+                         "). edit is withheld for one turn — re-read the failing output and find the "
+                         "wrong operation before editing again.]")
+        self.withheld.add('edit')
+        self.flat_edits, self.alt_flat = 0, True
+        return True
+
     def _run_verify(self):
         try:
             r = subprocess.run(self.verify_cmd, shell=True, cwd=self.arena, capture_output=True,
@@ -893,7 +992,11 @@ class Beekeeper:
         self._spend({"kind": "end", "reason": reason, "rc": rc, "turns": self.turn,
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
-                     "think_policy": self.think_policy})
+                     "think_policy": self.think_policy,
+                     # M-04: opportunity counts, reported whether the lever was on
+                     # or off — zero opportunities is a reading, not a silence
+                     "alt": self.alt_policy, "alternations": self.alternations,
+                     "no_progress_events": self.no_progress_events, "wanders": self.wanders})
         return rc
 
     def run(self, max_seconds=None):
@@ -1014,6 +1117,11 @@ class Beekeeper:
                 if sig in self.exhausted:
                     self.stall_refusals += 1
                     self.spend_turn["refused"] = True
+                    if self.alt_policy == 'on':
+                        # a refusal is sterile by definition, and it opens a fresh
+                        # detour window: the next one or two actions are a wander
+                        self.alt_detours = 0
+                        self.alt_trail.append((sig, True))
                     self.refused_count[sig] = self.refused_count.get(sig, 0) + 1
                     result = fail('blocked', f"refused — this exact call has returned the identical "
                                              f"result {self.exhausted[sig]}x and will not run again until "
@@ -1047,7 +1155,32 @@ class Beekeeper:
                     result = fail('args', str(e))
                 except Exception as e:
                     result = fail('exec', f"{type(e).__name__}: {e}")
-                self.stall_refusals = 0
+                # H-15, the wander law: one or two unrelated actions between two
+                # refusals are a detour, not a fresh start — the streak survives
+                # them (arm E's pattern: refusal, one action, refusal, for sixty
+                # turns). A third is a new line of work and clears it; a
+                # successful edit or write always clears it: progress is never
+                # punished, and that exemption is the stall law's, untouched.
+                progress = name in ('edit', 'write') and not str(result).startswith('ERROR')
+                if self.alt_policy != 'on':
+                    self.stall_refusals, self.alt_detours = 0, 0
+                elif progress:
+                    self.alt_detours = 0
+                    # the exemption is for PROGRESS, and the harness measures it: an
+                    # edit clears the streak unless the last verify said in so many
+                    # words that the edits before it moved nothing. It is never
+                    # punished either way — no refusal, no exhaustion, no withhold.
+                    if not self.alt_flat:
+                        self.stall_refusals = 0
+                else:
+                    self.alt_detours += 1
+                    if self.alt_detours > ALT_DETOUR:
+                        self.stall_refusals, self.alt_detours = 0, 0
+                    elif self.stall_refusals:
+                        self.wanders += 1
+                        self._spend({"kind": "alt", "turn": turn, "pattern": "wander",
+                                     "detour": self.alt_detours, "sig": sig,
+                                     "streak": self.stall_refusals})
                 self.withheld.clear()            # something executed: the schema is whole again
                 cmd = str(args.get('command') or '')
                 is_verify = name == 'bash' and bool(cmd) and (
@@ -1062,15 +1195,28 @@ class Beekeeper:
                     self.spend_turn["failing"] = self.failing_count(str(result))
                     if not self.last_verify_red:
                         self.edits_since_green = 0
-                changed_world = name in ('edit', 'write') and not str(result).startswith('ERROR')
+                    if self.alt_policy == 'on' and self._alt_no_progress(str(result), turn) \
+                            and self.stall_refusals >= STALL_LIMIT:
+                        self.alt_stall = "edits that never moved the verify"
+                changed_world = progress
                 if changed_world:
                     self.edits_since_green += 1
+                    self.flat_edits += 1
                 if changed_world and self.exhausted:
                     self.exhausted.clear()   # the world changed; a re-probe is new information
                 # collapse-with-count (eiDOS): repetition rendered AS repetition —
                 # never of a successful edit or write: progress is exempt even
                 # when its confirmation text repeats
                 rsha = hashlib.sha1(str(result).encode()).hexdigest()
+                if self.alt_policy == 'on':
+                    # sterile: this action returned the result it returned before —
+                    # no new information, whoever asked in between (the period-1
+                    # law only sees a repeat that is IMMEDIATELY consecutive)
+                    sterile = self.sig_result.get(sig) == rsha
+                    self.sig_result[sig] = rsha
+                    self._alt_step(sig, sterile, progress, turn)
+                    if self.stall_refusals >= STALL_LIMIT:
+                        self.alt_stall = "an alternating cycle"
                 repeated = collapsed = False
                 if changed_world:
                     self.last_result, self.repeat_run = (sig, rsha), 0
@@ -1138,6 +1284,17 @@ class Beekeeper:
                         "Do NOT run it again — change METHOD entirely: different tool, different file, "
                         "or re-diagnose from the failing output above.]"})
                     self.sig_history.clear()
+            if self.alt_note:
+                # flushed after the turn's calls: the collapse machinery pops the
+                # tail of self.messages, so nothing of ours may sit under it
+                self.messages.append({"role": "user", "content": self.alt_note})
+                self.alt_note = None
+            if self.alt_stall:
+                # the streak reached the limit through a pattern rather than a
+                # refusal: the turn is finished and recorded, then the run ends
+                log(f"[beekeeper] stalled: {self.stall_refusals} consecutive refused repeats "
+                    f"({self.alt_stall}); ending")
+                return self._end("stalled", 3)
         log("[beekeeper] turn limit reached"); return self._end("turn budget", 1)
 
 def _may_restart(left, walls, floor=RESTART_FLOOR_S):
