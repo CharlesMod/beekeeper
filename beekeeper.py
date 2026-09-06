@@ -1056,7 +1056,7 @@ class Beekeeper:
                 if is_verify:
                     self.last_verify_red = not str(result).startswith('exit 0')
                     if self.board_rows:
-                        m0 = re.match(r'exit (\\d+)', str(result))
+                        m0 = re.match(r'exit (\d+)', str(result))
                         self._observe(int(m0.group(1)) if m0 else (1 if self.last_verify_red else 0), str(result), turn)
                     self.spend_turn["verify"] = 'red' if self.last_verify_red else 'green'
                     self.spend_turn["failing"] = self.failing_count(str(result))
