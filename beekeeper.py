@@ -10,7 +10,7 @@ Third-generation harness, bred from three of its author's systems:
 Doctrine: the harness moves the model; the model never settles its own claims;
 the system never lies to the model; a refusal names the real rule.
 """
-import argparse, hashlib, json, os, re, signal, statistics, subprocess, sys, time
+import argparse, hashlib, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
 import urllib.request, urllib.error, urllib.parse
 
 def _cfg():
@@ -227,6 +227,13 @@ class Beekeeper:
         self.net_policy = os.environ.get('BEEKEEPER_NET', '').strip().lower() or 'on'
         self.net_source = 'env' if os.environ.get('BEEKEEPER_NET', '').strip() else 'default'
         self.net_cmd = self._net_cmd(verify_cmd) if (verify_cmd and self.net_policy != 'off') else None
+        # H-09b: under `bg` the baseline runs in a thread over a COPY of the tree
+        # taken before turn 1 — a run that edits pays nothing on the clock for a
+        # gate that fired in 0 of 28 runs on pool v2, and H-09's law (the
+        # baseline precedes the first edit) is kept by waiting, not by hurrying
+        self.net_snapshot = None         # the copy's root, outside the arena; removed at the end
+        self.net_thread = None
+        self.net_bg = None               # the thread's failing set; None if it could not run
         # H-32, the auto-verify: after every successful edit or write the harness
         # runs the verify itself and the result is the next observation — progress
         # becomes visible without the model asking. Off by default.
@@ -300,6 +307,8 @@ class Beekeeper:
             self._observe(code, out0, turn=0)
             if code == 0:
                 log("[beekeeper] WARNING: verify already green at start — a check that cannot fail cannot gate")
+        if self.net_policy == 'bg' and self.net_cmd and self.net_baseline is None:
+            self._net_bg_start()
         log(f"[beekeeper] settings: budget={budget}({self.budget_source}) think={self.think_policy}({self.think_source}) "
             f"think_budget={self.think_base} think_ceiling={self.think_ceiling} "
             f"temperature={self.temperature:g}({self.temperature_source}) "
@@ -624,9 +633,9 @@ class Beekeeper:
         """Names pytest reports as FAILED or ERROR in its short summary."""
         return set(re.findall(r'^(?:FAILED|ERROR) (\S+\.py::\S+?)(?: - .*)?$', output or '', re.M))
 
-    def _run_cmd(self, cmd):
+    def _run_cmd(self, cmd, cwd=None):
         try:
-            r = subprocess.run(cmd, shell=True, cwd=self.arena, capture_output=True, text=True,
+            r = subprocess.run(cmd, shell=True, cwd=cwd or self.arena, capture_output=True, text=True,
                                errors='replace', timeout=self.bash_timeout)
             return r.returncode, (r.stdout or '') + (r.stderr or '')
         except subprocess.TimeoutExpired:
@@ -678,11 +687,61 @@ class Beekeeper:
             self.messages[idx]["content"] = body
             self.pin_idx.add(idx)
 
+    def _net_bg_start(self):
+        """H-09b: the baseline on a start-of-run snapshot, in a thread, so the
+        model reads while it runs. The COPY is synchronous — a snapshot taken
+        while the model edits is not a snapshot — and it lives outside the
+        arena, which the tamper monitor walks. A copy that cannot be made is
+        named and the run falls back to the synchronous baseline."""
+        t = time.time()
+        try:
+            root = tempfile.mkdtemp(prefix='bk-net-')
+            snap = os.path.join(root, 'arena')
+            shutil.copytree(self.arena, snap, symlinks=True, ignore_dangling_symlinks=True)
+        except (OSError, shutil.Error) as e:
+            log(f"[beekeeper] net bg: snapshot failed ({e}) — the baseline will be measured synchronously")
+            return
+        self.net_snapshot = root
+        wall = time.time() - t
+        self._spend({"kind": "net", "stage": "snapshot", "wall": round(wall, 2), "path": snap})
+
+        def work():
+            try:
+                _, out = self._run_cmd(self.net_cmd, cwd=snap)
+                self.net_bg = self.failing_tests(out)
+            except Exception as e:          # the snapshot is removed under it when a run ends early
+                log(f"[beekeeper] net bg: baseline did not finish ({type(e).__name__}: {e})")
+        self.net_thread = threading.Thread(target=work, daemon=True)
+        self.net_thread.start()
+        log(f"[beekeeper] net baseline running in the background on a {wall:.1f}s snapshot")
+
     def _net_baseline(self):
         """Measured once, before the first edit or write: which tests in the
-        named tests' files fail as the tree stands. Never assumed."""
+        named tests' files fail as the tree stands. Never assumed.
+
+        Under `bg` the measurement is already running on the start-of-run
+        snapshot: an edit that arrives first WAITS for it — H-09's law is that
+        the baseline precedes the first edit — and the wait is a record."""
         if self.net_cmd is None or self.net_baseline is not None:
             return
+        if self.net_thread is not None:
+            alive = self.net_thread.is_alive()
+            t = time.time()
+            self.net_thread.join()
+            waited = time.time() - t
+            self.net_thread = None
+            if alive:
+                log(f"[beekeeper] net baseline: waited {waited:.1f}s for the background baseline")
+                self._spend({"kind": "net", "stage": "wait", "waited": round(waited, 2)})
+            if self.net_bg is not None:
+                self.net_baseline = self.net_bg
+                log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
+                    + (" (background)" if not alive else f" (background, {waited:.1f}s waited)"))
+                self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
+                             "names": sorted(self.net_baseline)[:40], "bg": True,
+                             "waited": round(waited, 2)})
+                return
+            log("[beekeeper] net bg: no background result — measuring synchronously")
         code, out = self._run_cmd(self.net_cmd)
         self.net_baseline = self.failing_tests(out)
         log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
@@ -973,6 +1032,11 @@ class Beekeeper:
                      # had a gate to act at is unmeasured, never inert
                      "autoverifies": self.autoverifies,
                      "autoverify_skipped": self.autoverify_skipped})
+        if self.net_snapshot:
+            # the background baseline is a daemon thread: it dies with the process,
+            # and the copy does not outlive the run either way
+            shutil.rmtree(self.net_snapshot, ignore_errors=True)
+            self.net_snapshot = None
         return rc
 
     def run(self, max_seconds=None):
