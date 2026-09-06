@@ -10,7 +10,7 @@ Third-generation harness, bred from three of its author's systems:
 Doctrine: the harness moves the model; the model never settles its own claims;
 the system never lies to the model; a refusal names the real rule.
 """
-import argparse, ast, difflib, hashlib, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
+import argparse, ast, difflib, hashlib, json, os, re, shlex, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
 import urllib.request, urllib.error, urllib.parse
 
 def _cfg():
@@ -459,7 +459,8 @@ class Beekeeper:
         # iceberg: three named cases greened, four siblings left red, done).
         self.net_policy = os.environ.get('BEEKEEPER_NET', '').strip().lower() or 'on'
         self.net_source = 'env' if os.environ.get('BEEKEEPER_NET', '').strip() else 'default'
-        self.net_cmd = self._net_cmd(verify_cmd) if (verify_cmd and self.net_policy != 'off') else None
+        self.net_cmd, self.net_stripped = (self._net_derive(verify_cmd)
+                                           if (verify_cmd and self.net_policy != 'off') else (None, []))
         # H-09b: under `bg` the baseline runs in a thread over a COPY of the tree
         # taken before turn 1 — a run that edits pays nothing on the clock for a
         # gate that fired in 0 of 28 runs on pool v2, and H-09's law (the
@@ -490,8 +491,8 @@ class Beekeeper:
         self.board_rows = {}            # test id -> (state, turn): red | green | '?'; flipped by verification alone
         self.board_flips = []           # (turn, id) each time a row turns green
         if self.board_policy == 'on' and verify_cmd:
-            for m in self._TEST_ID.finditer(verify_cmd):
-                self.board_rows.setdefault(f"{m.group(3)}::{m.group(4)}", ('?', 0))
+            for f, name in self.test_ids(verify_cmd):
+                self.board_rows.setdefault(f"{f}::{name}", ('?', 0))
         # H-02, the trend: the checkpoint law already scores every verify
         # (`failing_count`) and that scalar died in the ledger — the model saw a
         # fresh red wall each turn and could not tell a fix that moved two
@@ -1326,24 +1327,82 @@ class Beekeeper:
             lines.append(f"{i}. {r.get('title','')}\n   {r.get('url','')}\n   {snippet}")
         return '\n'.join(lines) or "(no results — try different terms)"
 
-    # an id is a file, `::`, a name; the name stops at whitespace, quotes and
-    # shell punctuation (a bare id is followed by the `;` that ends pytest)
-    _TEST_ID = re.compile(r"""(\s*)(['"]?)([\w./-]+\.py)::([^\s'";&|()<>]+)\2""")
+    # An id is a file, `::`, a name — in one of three shapes, because
+    # shlex.quote wraps any id holding a space in single quotes and a
+    # hand-written verify may use double ones. The FILE half is never a
+    # quoted string with spaces in it (it is a path), and requiring it to be
+    # space-free is what stops a quoted alternative from swallowing a whole
+    # `bash -c "…"` argument; the NAME half may hold spaces, brackets and —
+    # through shlex's own '"'"' escape — quotes. A bare id stops at the shell
+    # punctuation that follows it (the `;` that ends a pytest command).
+    _SQ_BODY = r"""(?:'"'"'|[^'])*"""       # shlex writes a quote inside a quoted word as '"'"'
+    _ID_SQ = r"""'[^'\s]+\.py::""" + _SQ_BODY + r"""'"""
+    _ID_DQ = r'''"[^"\s]+\.py::[^"]*"'''
+    _ID_BARE = r"""[\w./-]+\.py::[^\s'";&|()<>]+"""
+    _TEST_ID = re.compile(r"(\s*)(?:" + _ID_SQ + "|" + _ID_DQ + "|" + _ID_BARE + ")")
+    # SD-06: the verify runs EVERY named test so the failing count is a
+    # gradient and not a bit. The net's run over whole files inherits that
+    # rule — under `-x` the baseline saw one failing sibling where five were.
+    # Whole tokens only: `-rx` is pytest's report selector and a path may
+    # hold the letters.
+    _FAIL_FAST = re.compile(r"""(\s+)(-x|--exitfirst|--maxfail=\d+|--maxfail\s+\d+)(?=[\s;&|"']|$)""")
 
     @classmethod
-    def _net_cmd(cls, verify_cmd):
-        """The verify over the FILES the named tests live in, one entry per
-        file (a dropped duplicate takes its leading whitespace with it); None
-        when the command names no tests."""
+    def _id_of(cls, m):
+        """The (file, name) an id match denotes — TOKENISED: shell quoting and
+        shlex's own escapes off, then split on the FIRST `::`. Scraping the
+        name half with a character class stopped it at the first space, so a
+        quoted parametrised id lost its closing quote."""
+        raw = m.group(0)[len(m.group(1)):]
+        try:
+            tok = shlex.split(raw)
+        except ValueError:
+            return None                    # unbalanced quotes: not an id we can read
+        if len(tok) != 1 or '::' not in tok[0]:
+            return None
+        f, name = tok[0].split('::', 1)
+        return (f, name) if f.endswith('.py') else None
+
+    @classmethod
+    def test_ids(cls, verify_cmd):
+        """Every test id the command names, as (file, name) pairs."""
+        return [x for x in (cls._id_of(m) for m in cls._TEST_ID.finditer(verify_cmd or '')) if x]
+
+    @classmethod
+    def _net_derive(cls, verify_cmd):
+        """(the net command, the fail-fast flags stripped from it).
+
+        The verify over the FILES the named tests live in, one entry per file
+        (a dropped duplicate takes its leading whitespace with it), with the
+        fail-fast flags removed. The file is read from a properly TOKENISED
+        id split on its first `::` — scraping it stopped the name half at the
+        first space, and a shlex-quoted parametrised id ('a.py::t[x y]') came
+        out as `'a.py b]'`: a file that does not exist, and an exit 4 that
+        used to be read as a baseline of zero. (None, []) when the command
+        names no tests."""
         seen = []
         def sub(m):
-            f = m.group(3)
+            got = cls._id_of(m)
+            if got is None:
+                return m.group(0)          # not an id we can read: left exactly as it is
+            f = got[0]
             if f in seen:
                 return ''
             seen.append(f)
-            return m.group(1) + f
+            return m.group(1) + shlex.quote(f)
         out = cls._TEST_ID.sub(sub, verify_cmd)
-        return out if seen else None
+        if not seen:
+            return None, []
+        stripped = []
+        def drop(m):
+            stripped.append(' '.join(m.group(2).split()))
+            return ''
+        return cls._FAIL_FAST.sub(drop, out), stripped
+
+    @classmethod
+    def _net_cmd(cls, verify_cmd):
+        """The net command alone; `_net_derive` also names what it stripped."""
+        return cls._net_derive(verify_cmd)[0]
 
     @staticmethod
     def _unmeasured(code, out):
@@ -1548,7 +1607,8 @@ class Beekeeper:
             return
         self.net_baseline_recorded = True
         rec = {"kind": "net", "stage": "baseline", "turn": self.turn,
-               "failing": None, "names": [], "pending": False, "policy": self.net_policy}
+               "failing": None, "names": [], "pending": False, "policy": self.net_policy,
+               "stripped": list(self.net_stripped)}   # SD-06: what the net does not inherit
         rec.update(fields)
         self._spend(rec)
 
