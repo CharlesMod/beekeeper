@@ -243,8 +243,15 @@ class Beekeeper:
         self.create_policy = os.environ.get('BEEKEEPER_CREATE', '').strip().lower() or 'off'
         self.create_source = 'env' if os.environ.get('BEEKEEPER_CREATE', '').strip() else 'default'
         self.create_offer = None         # {turn, targets, paths, taken, noted}: one live offer
-        self.create_offers = 0           # missing paths seen
-        self.create_taken = 0            # files created through the offer
+        self.create_offers = 0           # H-51: the gate — missing paths seen
+        self.create_taken = 0            # H-51: the act — files created through the offer
+        # H-51 (M-04): every lever's OPPORTUNITY count, kept where the lever acts
+        self.attempt = 1                 # run_attempts overwrites it; restarts = attempt - 1
+        self.exhaustion_events = 0       # actions the stall law exhausted
+        self.withheld_turns = 0          # turns whose schema was short a tool
+        self.net_baselines = 0           # baselines the net actually measured
+        self.net_gate_reached = 0        # times done reached the net's judgment
+        self.net_refusals = 0            # times the net refused a done
         self.end_reason = None
         self.net_baseline = None           # names failing in those files before the first edit
         self.net_override = False          # a second done accepts pre-existing siblings
@@ -865,6 +872,7 @@ class Beekeeper:
             return
         code, out = self._run_cmd(self.net_cmd)
         self.net_baseline = self.failing_tests(out)
+        self.net_baselines += 1
         log(f"[beekeeper] net baseline: {len(self.net_baseline)} failing in the named tests' files"
             + (": " + ", ".join(sorted(self.net_baseline))[:300] if self.net_baseline else ""))
         self._spend({"kind": "net", "stage": "baseline", "failing": len(self.net_baseline),
@@ -890,6 +898,7 @@ class Beekeeper:
             if code != 0:
                 return fail('blocked', f"done refused — verify exited {code}. The work is not done:\n{out}")
         if self.net_cmd:
+            self.net_gate_reached += 1
             self._net_baseline()
             ncode, nout = self._run_cmd(self.net_cmd)
             now = self.failing_tests(nout)
@@ -898,11 +907,13 @@ class Beekeeper:
             self._spend({"kind": "net", "stage": "done", "failing": len(now), "regressions": regressions[:40],
                          "siblings": siblings[:40], "override": self.net_override})
             if regressions:
+                self.net_refusals += 1
                 return fail('blocked', "done refused — regression: tests in the files your tests live in "
                                        f"passed before your edits and fail now: {', '.join(regressions)[:400]}\n"
                                        f"{nout[-1200:]}")
             if siblings and not self.net_override:
                 self.net_override = True
+                self.net_refusals += 1
                 return fail('blocked', "done refused ONCE — the named tests pass, but tests in the same files "
                                        f"still fail ({len(siblings)}): {', '.join(siblings)[:400]}. They failed "
                                        "before you started, so they may be part of this issue. Fix them if "
@@ -960,6 +971,8 @@ class Beekeeper:
         withheld = self.withheld - {'done'}
         if self.withhold_policy == 'turn':
             self.withheld = set()        # consumed by this build: one turn only (arm D)
+        if withheld:
+            self.withheld_turns += 1
         base = (TOOLS + [self._create_tool()]) if self._create_live() else TOOLS
         if not withheld:
             return base
@@ -1081,6 +1094,36 @@ class Beekeeper:
                 log(f"[beekeeper] stream died ({str(e)[:100]}) — resurrecting")
         return None
 
+    def opportunities(self):
+        """H-51 (instrument-law.md M-04): one documented place where every
+        lever's OPPORTUNITY count sits beside what it did. A lever that acts at
+        a gate is `unmeasured` when the gate was never reached — the net was
+        called inert on pool v2 after firing in 0 of 28 runs, and only a
+        hand-count of the transcripts showed no run had ever reached `done`
+        green. Zero here is a measurement; an absent block is not.
+
+            restart   stalls                             / restarts
+            withhold  exhaustions, refusals              / withheld_turns
+            board     board_rows                         / board_flips
+            net       net_baselines, net_gate_reached    / net_refusals
+            think     turns                              / think_turns
+            create    create_offers                      / create_taken
+        """
+        return {"turns": self.turn,
+                "stalls": int(self.end_reason == "stalled"),
+                "restarts": max(0, int(getattr(self, "attempt", 1)) - 1),
+                "exhaustions": self.exhaustion_events,
+                "refusals": sum(self.refused_count.values()),
+                "withheld_turns": self.withheld_turns,
+                "board_rows": len(self.board_rows),
+                "board_flips": len(self.board_flips),
+                "net_baselines": self.net_baselines,
+                "net_gate_reached": self.net_gate_reached,
+                "net_refusals": self.net_refusals,
+                "think_turns": sum(1 for _, t in self.think_log if t),
+                "create_offers": self.create_offers,
+                "create_taken": self.create_taken}
+
     def _end(self, reason, rc):
         self.end_reason = reason
         if self.spend_turn:
@@ -1090,7 +1133,8 @@ class Beekeeper:
                      "t": round(time.time() - self.t0, 2), "arena": self.arena,
                      "compactions": self.compactions, "model": self.model,
                      "think_policy": self.think_policy,
-                     "create_offers": self.create_offers, "create_taken": self.create_taken})
+                     "create_offers": self.create_offers, "create_taken": self.create_taken,
+                     "opportunities": self.opportunities()})
         return rc
 
     def run(self, max_seconds=None):
@@ -1285,6 +1329,7 @@ class Beekeeper:
                     # forever. Repetition itself is the signal.
                     if n >= 3:
                         repeated = True
+                        self.exhaustion_events += 1
                         self.exhausted[sig] = n
                         self.exhausted_idx[sig] = self.last_result_idx
                         self.withheld.add(name)
