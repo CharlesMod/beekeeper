@@ -127,8 +127,11 @@ def test_the_board_fits_its_budget(arena):
 def test_a_verify_that_could_not_collect_leaves_rows_unmeasured(arena):
     """M-02: exit 4 with 'not found' proves nothing — rows keep their last
     state instead of flipping red (B3 found the exit-code regex never matched)."""
-    cannot = "sh -c 'echo \"ERROR: not found: tests/t.py::a\"; echo \"no tests ran in 0.01s\"; exit 4' -- pytest " + IDS
-    bk = Scripted(arena, [("bash", {"command": GREEN}), ("bash", {"command": cannot})])
+    # exit 4 with NO signature phrase: only the exit code says the run measured nothing;
+    # the old regex (a doubled backslash) never matched, read the exit as red, found no
+    # FAILED lines and greened every row
+    cannot = "sh -c 'echo usage: pytest: error: unrecognized arguments; exit 4' -- pytest " + IDS
+    bk = Scripted(arena, [("bash", {"command": cannot})])      # rows start red from the start verify
     bk.run()
     text = _board(bk)[0]["content"]
-    assert "✓ tests/t.py::a" in text and "✓ tests/t.py::b" in text, text
+    assert "✗ tests/t.py::a" in text and "✗ tests/t.py::b" in text and "✓ tests/t.py::c" in text, text
