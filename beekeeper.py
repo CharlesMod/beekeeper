@@ -209,6 +209,56 @@ def symbol_map(path, text, cap=SYMBOLMAP_MAX):
         out.append(f"… +{len(rows) - len(keep)} more symbols not shown")
     return "\n".join(out)
 
+# ---------- H-06: traceback capture ----------
+# pytest puts the assertion, the last frames and the FAILED summary at the END
+# of its output; bash kept the first 3500 characters. The budget is unchanged —
+# what it buys is not.
+SALIENT_RE = re.compile(
+    r'^(?:E\s|FAILED\b|ERROR\b|[A-Za-z_.]*(?:Error|Exception|Warning)\b.*:|'
+    r'\s*Traceback \(most recent call last\)|\s+File "|'
+    r'=+ (?:FAILURES|ERRORS|short test summary info)|'
+    r'=*\s*\d+ (?:failed|passed|error))')     # pytest's count line: the score itself
+
+def clip_output(text, limit):
+    """Keep the head, the tail, and every failure line that would otherwise
+    have been elided between them. Output that fits is returned untouched."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    lines = text.splitlines()
+    tail_budget, i, used = max(1, (limit * 3) // 5), len(lines) - 1, 0
+    while i >= 0 and used + len(lines[i]) + 1 <= tail_budget:
+        used += len(lines[i]) + 1
+        i -= 1
+    tail_start = max(1, i + 1)
+    sal_budget, sal, s_used = max(0, limit // 4), [], 0
+    for j in range(tail_start - 1, -1, -1):          # nearest the failure first
+        if SALIENT_RE.match(lines[j]):
+            if s_used + len(lines[j]) + 1 > sal_budget:
+                break
+            sal.append(j); s_used += len(lines[j]) + 1
+    sal.reverse()
+    head_budget, h, h_used = limit - used - s_used - 64, 0, 0
+    while h < tail_start and h_used + len(lines[h]) + 1 <= head_budget:
+        h_used += len(lines[h]) + 1
+        h += 1
+    drop = 0                                          # salient lines given up, oldest first
+    while True:
+        kept = [j for j in sal[drop:] if j >= h]
+        marker = (f"... [{tail_start - h - len(kept)} lines elided"
+                  + (f"; {len(kept)} failure lines kept" if kept else "") + "] ...")
+        out = "\n".join(lines[:h] + [marker] + [lines[j] for j in kept] + lines[tail_start:])
+        if len(out) <= limit:
+            return out
+        if h > 0:                                     # the head yields first
+            h -= 1
+        elif drop < len(kept):                        # then the oldest rescued frames
+            drop += 1
+        else:                                         # the tail is last, and never mid-line
+            tail_start += 1
+            if tail_start >= len(lines):
+                return out[-limit:]
+
 def auto_verify(arena):
     """Detect the arena's own check. Verification is the DEFAULT posture."""
     j = lambda *p: os.path.join(arena, *p)
@@ -440,6 +490,12 @@ class Beekeeper:
         self.mapped = set()              # paths whose last serve was a map, not a body
         self.maps_served = 0             # H-51 opportunity counts: big reads answered with a map
         self.ranged_reads = 0            # …and ranges the model then asked for
+        # H-06, traceback capture: the same character budget buys head AND tail,
+        # with the pytest failure lines lifted out of the elided middle. Off by
+        # default: with it off every truncation is byte-identical.
+        self.traceback_policy = os.environ.get('BEEKEEPER_TRACEBACK', '').strip().lower() or 'off'
+        self.traceback_source = 'env' if os.environ.get('BEEKEEPER_TRACEBACK', '').strip() else 'default'
+        self.clips = 0                   # H-51: outputs that were too big to keep whole
         # H-51 (M-04): every lever's OPPORTUNITY count, kept where the lever acts
         self.attempt = 1                 # run_attempts overwrites it; restarts = attempt - 1
         self.exhaustion_events = 0       # actions the stall law exhausted
@@ -514,7 +570,7 @@ class Beekeeper:
             f"autoverify={self.autoverify_policy}({self.autoverify_source}) autoverify_max_s={self.autoverify_max_s:g} "
             f"withhold={self.withhold_policy}({self.withhold_source}) net={self.net_policy}({self.net_source}) board={self.board_policy}({self.board_source}) restart={self.restart_policy}({self.restart_source}) create={self.create_policy}({self.create_source}) "
             f"symbolmap={self.symbolmap_policy}({self.symbolmap_source}) symbolmap_chars={self.symbolmap_chars}({self.symbolmap_chars_source}) "
-            f"max_turns={MAX_TURNS} "
+            f"traceback={self.traceback_policy}({self.traceback_source}) max_turns={MAX_TURNS} "
             f"nudge_limit={NUDGE_LIMIT} stall_limit={STALL_LIMIT} answer_room={self.ANSWER_ROOM} "
             f"max_tokens={self.max_tokens} model={self.model}")
 
@@ -963,7 +1019,15 @@ class Beekeeper:
         if p.returncode < 0 or p.returncode >= 126:
             self.poison[sig] = self.poison.get(sig, 0) + 1
         out = (out or '').strip() or "(no output)"
-        if len(out) > 3500: out = out[:3500] + "\n... [truncated]"
+        if len(out) > 3500:
+            # H-06: the same budget, spent on both ends. The head-only cut threw
+            # away the assertion, the last frames and the FAILED summary — the
+            # only part of a pytest run that says what to do next.
+            if self.traceback_policy == 'on':
+                self.clips += 1
+                out = clip_output(out, 3500)
+            else:
+                out = out[:3500] + "\n... [truncated]"
         self.ledger.append(f"bash: {command[:60]} -> exit {p.returncode}")
         return f"exit {p.returncode}\n{out}"
 
@@ -1249,7 +1313,15 @@ class Beekeeper:
         try:
             r = subprocess.run(self.verify_cmd, shell=True, cwd=self.arena, capture_output=True,
                                text=True, timeout=120, stdin=subprocess.DEVNULL)
-            out = (r.stdout + r.stderr)[-1500:]
+            whole = r.stdout + r.stderr
+            # H-06: the verify's mirror fault — the tail alone drops the command,
+            # the collection line and the first error that explains the rest.
+            if self.traceback_policy == 'on':
+                if len(whole) > 1500:
+                    self.clips += 1
+                out = clip_output(whole, 1500)
+            else:
+                out = whole[-1500:]
             code = r.returncode
         except subprocess.TimeoutExpired:
             code, out = 124, "verify timed out"
@@ -1305,7 +1377,8 @@ class Beekeeper:
                      "failing": failing, "wall": round(wall, 2)})
         head = f"exit {code}" + (f" · {failing} failing" if failing is not None else "")
         body = (f"[auto-verify — the harness ran the verify command itself after your edit; "
-                f"you did not ask for this and it did not cost you a turn]\n{head}\n{str(out)[-1200:]}")
+                f"you did not ask for this and it did not cost you a turn]\n{head}\n"
+                + (clip_output(out, 1200) if self.traceback_policy == 'on' else str(out)[-1200:]))
         idx = len(self.messages)
         self.messages.append({"role": "tool", "tool_call_id": f"autoverify-t{turn}", "content": body})
         self._pin_red(idx, body)
