@@ -1,7 +1,7 @@
 <p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
-  <img alt="beekeeper, an honest coding harness" src="assets/banner-light.png" width="753">
+  <img alt="beekeeper, an honest coding harness" src="assets/banner-light.png" width="635">
 </picture>
 </p>
 
