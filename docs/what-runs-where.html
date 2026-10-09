@@ -1,0 +1,348 @@
+<title>What Runs Where</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a frame menu first (the Queen's question), then the card x context staircase, then each model's reach. */
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #0f1620; --ink-2: #4a5462; --ink-3: #7b8594;
+  --rule: #dfe3e9; --hi: #fff4d6; --accent: #1c5cab;
+  --t2: #86b6ef; --t4: #5598e7; --t6: #2a78d6; --t8: #1c5cab; --t12: #104281; --t16: #0d366b;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121417; --panel: #1a1d21; --ink: #f1f3f6; --ink-2: #b6bdc7; --ink-3: #848c97;
+  --rule: #2c3138; --hi: #3a3220; --accent: #6da7ec;
+  --t2: #184f95; --t4: #256abf; --t6: #3987e5; --t8: #6da7ec; --t12: #9ec5f4; --t16: #cde2fb;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121417; --panel: #1a1d21; --ink: #f1f3f6; --ink-2: #b6bdc7; --ink-3: #848c97;
+  --rule: #2c3138; --hi: #3a3220; --accent: #6da7ec;
+  --t2: #184f95; --t4: #256abf; --t6: #3987e5; --t8: #6da7ec; --t12: #9ec5f4; --t16: #cde2fb;
+  color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--display); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 56px; display: grid; gap: 28px; }
+h1 { font: 800 clamp(28px, 4vw, 40px)/1.05 var(--display); font-stretch: 85%; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { font: 700 20px/1.2 var(--display); font-stretch: 90%; margin: 0; text-wrap: balance; }
+p { margin: 0; max-width: 72ch; color: var(--ink-2); }
+.lede { display: grid; gap: 8px; }
+.eyebrow { font: 500 12px/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+section { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 20px; display: grid; gap: 14px; min-width: 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; }
+.ctl { display: flex; align-items: center; gap: 8px; }
+.ctl > span { font: 500 12px/1 var(--mono); color: var(--ink-3); letter-spacing: 0.04em; text-transform: uppercase; }
+.seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 7px; overflow: hidden; }
+.seg button { font: 500 13px/1 var(--mono); padding: 7px 10px; border: 0; background: transparent; color: var(--ink-2); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--panel); }
+.seg button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+select { font: 500 13px/1 var(--mono); padding: 7px 8px; border: 1px solid var(--rule); border-radius: 7px; background: var(--panel); color: var(--ink); max-width: 100%; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { font: 500 11px/1.2 var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-3); }
+td.num { font-family: var(--mono); font-size: 13px; }
+td.muted, .muted { color: var(--ink-3); }
+tr.mark td { background: var(--hi); }
+.tag { display: inline-block; font: 500 11px/1 var(--mono); padding: 4px 6px; border-radius: 4px; border: 1px solid var(--rule); color: var(--ink-2); }
+.tag.pick { border-color: var(--accent); color: var(--accent); }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; vertical-align: -1px; }
+.model { font-weight: 650; }
+.tier { font: 500 11px/1 var(--mono); color: var(--ink-3); margin-left: 6px; }
+.grid { display: grid; grid-template-columns: 92px repeat(8, minmax(112px, 1fr)); gap: 2px; min-width: 980px; }
+.gh { font: 500 11px/1 var(--mono); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 6px; }
+.rh { font: 600 14px/1.2 var(--mono); padding: 10px 6px; display: flex; flex-direction: column; justify-content: center; }
+.rh small { font: 400 11px/1.2 var(--mono); color: var(--ink-3); }
+.cell { border-radius: 6px; padding: 8px; min-height: 62px; display: grid; gap: 2px; align-content: start; cursor: default; position: relative; border: 1px solid transparent; }
+.cell .nm { font-weight: 650; font-size: 13px; line-height: 1.2; }
+.cell .q { font: 500 12px/1 var(--mono); }
+.cell .gb { font: 400 11px/1.3 var(--mono); color: var(--ink-2); }
+.cell.empty { background: transparent; border: 1px dashed var(--rule); color: var(--ink-3); font: 400 11px/1.2 var(--mono); }
+.cell.exp::after { content: "experts in RAM"; font: 500 10px/1 var(--mono); color: var(--ink-2); }
+.cell.cpu::after { content: "CPU"; font: 500 10px/1 var(--mono); color: var(--ink-2); }
+.cell:hover, .cell:focus-visible { border-color: var(--ink-3); outline: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font: 500 12px/1 var(--mono); color: var(--ink-2); }
+#tip { position: fixed; z-index: 10; pointer-events: none; background: var(--panel); color: var(--ink); border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; font: 400 12px/1.45 var(--mono); max-width: 340px; box-shadow: 0 6px 24px rgb(0 0 0 / 0.18); }
+#tip b { font-family: var(--display); font-size: 13px; }
+svg text { fill: var(--ink-2); font: 400 11px var(--mono); }
+svg .lbl { fill: var(--ink); font: 600 13px var(--display); }
+svg .q { fill: var(--ink-3); }
+svg .rung { stroke: var(--rule); stroke-dasharray: 3 4; }
+svg .axis { stroke: var(--rule); }
+.notes { display: grid; gap: 6px; font-size: 13px; }
+.notes p { font-size: 13px; }
+@media (prefers-reduced-motion: no-preference) { .cell { transition: border-color .12s; } }
+</style>
+<div class="wrap">
+  <header class="lede">
+    <div class="eyebrow">hive-bench · 2026-10-02 · llama.cpp b10950 · KV q8_0 · flash attention</div>
+    <h1>What runs where</h1>
+    <p>Which model a frame can hold, at what context, with how many parallel slots. Memory comes from the engine's own projection of each configuration (its <code>--fit</code> dry run), fitted per model to within 37 MiB from 2k to 1M tokens. Quality is the share of 176 of the hive's own spoken asks answered right.</p>
+  </header>
+
+  <section aria-labelledby="menu-h">
+    <h2 id="menu-h">A frame's menu</h2>
+    <p>Everything one frame can serve, from the largest mind at its longest context (a council seat, a fan-in) to the most parallel slots of a small model (a fan-out). Slot counts are what memory holds; how many slots a frame can drive at a useful speed is a throughput measurement still to make.</p>
+    <div class="controls">
+      <label class="ctl"><span>Frame</span>
+        <select id="frame"></select></label>
+      <div class="ctl"><span>Headroom</span><div class="seg" id="head"></div></div>
+      <div class="ctl"><span>Offload</span><div class="seg" id="off"></div></div>
+    </div>
+    <div class="scroll"><table id="menu"></table></div>
+    <div class="legend" id="legend1"></div>
+  </section>
+
+  <section aria-labelledby="grid-h">
+    <h2 id="grid-h">The best model for a card and a context</h2>
+    <p>Each cell holds the highest-quality model that fits that card at that context per slot, with the slots and machine RAM chosen here. Shading follows the chosen model's VRAM tier: a dark cell on a small card is a big model riding on RAM.</p>
+    <div class="controls">
+      <div class="ctl"><span>Slots</span><div class="seg" id="slots"></div></div>
+      <div class="ctl"><span>Machine RAM</span><div class="seg" id="ram"></div></div>
+    </div>
+    <div class="scroll"><div class="grid" id="grid" role="grid"></div></div>
+  </section>
+
+  <section aria-labelledby="reach-h">
+    <h2 id="reach-h">How far each model reaches</h2>
+    <p>Each row starts at the card memory a model needs at 2k context and ends at its trained context; the dots mark 4k, 16k, 64k and 128k on the way. A short row is a model whose context is cheap. The dashed row under an MoE is the same model with its experts in RAM. Slots follow the control above.</p>
+    <div class="scroll"><svg id="reach" role="img" aria-label="Card memory each model needs, by context"></svg></div>
+    <details><summary class="muted">Show as a table</summary><div class="scroll"><table id="reachtable"></table></div></details>
+  </section>
+
+  <footer class="notes">
+    <div class="eyebrow">How the numbers are made</div>
+    <p>Card memory = weights on the card + slots × (fixed state + KV per token × context) + compute buffers (which grow with context × slots) + 64 MiB for the CUDA context. RAM = the weights left on the host + the runtime's 322 MiB, against the machine's RAM less 2 GB for its system. Headroom is what the card keeps free; the hive's engine keeps 1 GB today. "Experts in RAM" leaves an MoE's attention on the card and moves its experts to RAM: decode slows to the speed of RAM, prefill slows more. A context past a model's trained length is never shown: the engine would allocate it, but no RoPE scaling is applied. Speeds are measured where named; slot counts past four are projected from the measured one- and four-slot laws.</p>
+  </footer>
+</div>
+<div id="tip" hidden></div>
+<script>
+const MODELS = [{"name": "gemma-4-26b-a4b-iq3s", "short": "26B-A4B iq3s", "q": 0.909, "kind": "moe", "train": 262144, "card": {"weights_mib": 10751, "ctx_mib_per_slot": 159.1, "ctx_kib_per_token": 10.625, "compute_by_slots": {"1": [73.0, 4.9818], "4": [59.0, 17.0]}}, "hostWhole": 590.0, "cpu": {"weights_mib": 11329, "ctx_mib_per_slot": 159.1, "ctx_kib_per_token": 10.625, "compute_by_slots": {"1": [98.0, 1.0], "4": [98.0, 1.0]}}, "speed": {"whole": "181 tok/s on an RTX 5080", "experts": "19.5 tok/s on a GTX 1650 Ti + 6-core laptop (prefill 87 tok/s)", "cpu": "9.7 tok/s on a 6-core laptop CPU"}, "experts": {"cardWeights": 1963, "hostMib": 9394}}, {"name": "gemma-4-26b-a4b", "short": "26B-A4B iq4xs", "q": 0.903, "kind": "moe", "train": 262144, "card": {"weights_mib": 12952, "ctx_mib_per_slot": 159.1, "ctx_kib_per_token": 10.625, "compute_by_slots": {"1": [73.0, 4.9818], "4": [59.0, 17.0]}}, "hostWhole": 761.0, "cpu": {"weights_mib": 13700, "ctx_mib_per_slot": 159.1, "ctx_kib_per_token": 10.625, "compute_by_slots": {"1": [98.0, 1.0], "4": [98.0, 1.0]}}, "speed": {"whole": "159 tok/s on an RTX 5080", "experts": "25 tok/s split on a GTX 1080 + 16-core desktop"}, "experts": {"cardWeights": 2459, "hostMib": 11269}}, {"name": "qwen3.8-27b", "short": "Qwen3.8 27B", "q": 0.892, "kind": "dense", "train": 262144, "card": {"weights_mib": 11671, "ctx_mib_per_slot": 149.2, "ctx_kib_per_token": 34.0, "compute_by_slots": {"1": [82.0, 4.9974], "4": [80.0, 17.0]}}, "hostWhole": 540.0, "cpu": {"weights_mib": 12192, "ctx_mib_per_slot": 149.2, "ctx_kib_per_token": 34.0, "compute_by_slots": {"1": [132.0, 1.0], "4": [132.0, 1.0]}}, "speed": {"whole": "57 tok/s on an RTX 5080 (130 on code with MTP)", "partial": "3.4 tok/s with 24 of 65 layers on the card"}}, {"name": "qwen3.5-9b", "short": "Qwen3.5 9B", "q": 0.801, "kind": "dense", "train": 262144, "card": {"weights_mib": 5595, "ctx_mib_per_slot": 50.1, "ctx_kib_per_token": 17.0, "compute_by_slots": {"1": [56.0, 5.0], "4": [56.0, 17.0]}}, "hostWhole": 682.0, "cpu": {"weights_mib": 6262, "ctx_mib_per_slot": 50.1, "ctx_kib_per_token": 17.0, "compute_by_slots": {"1": [96.0, 1.0], "4": [96.0, 1.0]}}, "speed": {"whole": "124 tok/s on an RTX 5080"}}, {"name": "qwen3.5-4b", "short": "Qwen3.5 4B", "q": 0.795, "kind": "dense", "train": 262144, "card": {"weights_mib": 2351, "ctx_mib_per_slot": 50.1, "ctx_kib_per_token": 17.0, "compute_by_slots": {"1": [50.0, 5.0], "4": [50.0, 17.0]}}, "hostWhole": 507.0, "cpu": {"weights_mib": 2351, "ctx_mib_per_slot": 50.1, "ctx_kib_per_token": 17.0, "compute_by_slots": {"1": [69.0, 1.0], "4": [69.0, 1.0]}}, "speed": {"whole": "229 tok/s on an RTX 5080; ~20 on an RTX 3050 Laptop; 17 on a GTX 1650 Ti"}}, {"name": "gemma-4-e2b", "short": "Gemma e2b", "q": 0.722, "kind": "dense", "train": 131072, "card": {"weights_mib": 1407, "ctx_mib_per_slot": 6.1, "ctx_kib_per_token": 3.188, "compute_by_slots": {"1": [66.9, 2.9794], "4": [51.0, 9.0]}}, "hostWhole": 1781.0, "cpu": {"weights_mib": 3163, "ctx_mib_per_slot": 6.1, "ctx_kib_per_token": 3.188, "compute_by_slots": {"1": [111.0, 1.0], "4": [111.0, 1.0]}}, "speed": {"whole": "280 tok/s on an RTX 5080; 77 on an RTX 3050 Laptop or a GTX 1080"}}, {"name": "ling-3.0-tiny", "short": "Ling tiny", "q": 0.568, "kind": "moe", "train": 131072, "card": {"weights_mib": 4054, "ctx_mib_per_slot": 19.0, "ctx_kib_per_token": 3.586, "compute_by_slots": {"1": [73.0, 2.125], "4": [73.0, 5.5]}}, "hostWhole": 128.0, "cpu": {"weights_mib": 4176, "ctx_mib_per_slot": 19.0, "ctx_kib_per_token": 3.586, "compute_by_slots": {"1": [61.0, 1.0], "4": [61.0, 1.0]}}, "speed": {"whole": "315 tok/s on an RTX 5080", "experts": "56 tok/s on a GTX 1650 Ti", "cpu": "31 tok/s on a 6-core laptop CPU"}, "experts": {"cardWeights": 535, "hostMib": 3663}}, {"name": "minicpm5-2b", "short": "MiniCPM5 2B", "q": 0.494, "kind": "dense", "train": 131072, "card": {"weights_mib": 1340, "ctx_mib_per_slot": -0.1, "ctx_kib_per_token": 22.313, "compute_by_slots": {"1": [24.0, 1.9897], "4": [16.0, 5.0]}}, "hostWhole": 151.0, "cpu": {"weights_mib": 1484, "ctx_mib_per_slot": -0.1, "ctx_kib_per_token": 22.313, "compute_by_slots": {"1": [48.0, 1.0], "4": [48.0, 1.0]}}, "speed": {"whole": "346 tok/s on an RTX 5080; 83 on an RTX 3050 Laptop"}}, {"name": "nemotron-3-nano-4b", "short": "Nemotron Nano 4B", "q": null, "kind": "dense", "train": 1048576, "card": {"weights_mib": 2149, "ctx_mib_per_slot": 81.0, "ctx_kib_per_token": 8.5, "compute_by_slots": {"1": [52.2, 4.9932], "4": [47.0, 17.0]}}, "hostWhole": 281.0, "cpu": {"weights_mib": 2419, "ctx_mib_per_slot": 81.0, "ctx_kib_per_token": 8.5, "compute_by_slots": {"1": [113.0, 1.0], "4": [128.2, 0.9997]}}, "speed": {"whole": "280 tok/s on an RTX 5080; 31 on an RTX 3050 Laptop"}}, {"name": "lfm2.5-8b-a1b", "short": "LFM2.5 8B-A1B", "q": null, "kind": "moe", "train": 128000, "card": {"weights_mib": 4612, "ctx_mib_per_slot": 0.1, "ctx_kib_per_token": 6.375, "compute_by_slots": {"1": [20.0, 2.9948], "4": [16.0, 9.0]}}, "hostWhole": 213.0, "cpu": {"weights_mib": 4612, "ctx_mib_per_slot": 0.1, "ctx_kib_per_token": 6.375, "compute_by_slots": {"1": [54.0, 1.0], "4": [54.0, 1.0]}}, "speed": {"whole": "541 tok/s on an RTX 5080"}, "experts": {"cardWeights": 454, "hostMib": 4387}}];
+const OV_CARD = 64, OV_PROC = 322, OS_RAM = 2048;
+const CTXS = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+const RUNGS = [2, 4, 6, 8, 12, 16, 24];
+const TIERS = [2, 4, 6, 8, 12, 16];
+const FRAMES = [
+  { id: "5080", label: "RTX 5080 16 GB card · 31 GB RAM", card: 15.9, ram: 31 },
+  { id: "1080", label: "GTX 1080 8 GB card · 31 GB RAM", card: 8, ram: 31 },
+  { id: "3050", label: "RTX 3050 Laptop 4 GB card · 15 GB RAM", card: 4, ram: 15 },
+  { id: "1650", label: "GTX 1650 Ti 4 GB card · 15 GB RAM", card: 3.6, ram: 15 },
+  { id: "pi", label: "Raspberry Pi · no card · 3 GB RAM", card: 0, ram: 3 },
+  { id: "g24", label: "any 24 GB card · 64 GB RAM", card: 24, ram: 64 },
+  { id: "g12", label: "any 12 GB card · 32 GB RAM", card: 12, ram: 32 },
+  { id: "g6", label: "any 6 GB card · 16 GB RAM", card: 6, ram: 16 },
+  { id: "g2", label: "any 2 GB card · 8 GB RAM", card: 2, ram: 8 },
+  { id: "cpu16", label: "no card · 16 GB RAM", card: 0, ram: 16 },
+];
+const S = { frame: "5080", head: 0.5, off: true, slots: 2, ram: 16 };
+try { Object.assign(S, JSON.parse(localStorage.getItem("wrw") || "{}")); } catch (e) {}
+const save = () => { try { localStorage.setItem("wrw", JSON.stringify(S)); } catch (e) {} };
+
+function compute(law, c, n) {
+  const ks = Object.keys(law.compute_by_slots).map(Number).sort((a, b) => a - b);
+  let a, b;
+  if (ks.length === 1) [a, b] = law.compute_by_slots[ks[0]];
+  else {
+    const n0 = ks[0], n1 = ks[ks.length - 1];
+    const [a0, b0] = law.compute_by_slots[n0], [a1, b1] = law.compute_by_slots[n1];
+    const t = (n - n0) / (n1 - n0);
+    a = a0 + t * (a1 - a0); b = Math.max(0, b0 + t * (b1 - b0));
+  }
+  return a + b / 1024 * c;
+}
+const kv = (law, c, n) => n * (law.ctx_mib_per_slot + law.ctx_kib_per_token / 1024 * c);
+// MiB on the card and on the host, per placement
+function need(m, c, n, where) {
+  if (where === "whole") return { card: m.card.weights_mib + kv(m.card, c, n) + compute(m.card, c, n) + OV_CARD, host: m.hostWhole + OV_PROC };
+  if (where === "experts") return { card: m.experts.cardWeights + kv(m.card, c, n) + compute(m.card, c, n) + OV_CARD, host: m.experts.hostMib + OV_PROC };
+  return { card: 0, host: m.cpu.weights_mib + kv(m.cpu, c, n) + compute(m.cpu, c, n) + OV_PROC };
+}
+const placements = (m, hasCard, off) => hasCard ? (off && m.experts ? ["whole", "experts"] : ["whole"]) : (off ? ["cpu"] : []);
+function fits(m, c, n, where, cardGB, ramGB, head) {
+  if (c > m.train) return false;
+  const x = need(m, c, n, where);
+  return (x.card === 0 || x.card <= (cardGB - head) * 1024 + 0.5) && x.host <= ramGB * 1024 - OS_RAM;
+}
+// the first placement (whole before experts in RAM) that holds c x n on this frame
+function placeOn(m, c, n, cardGB, ramGB, head, off) {
+  for (const w of placements(m, cardGB > 0, off)) if (fits(m, c, n, w, cardGB, ramGB, head)) return w;
+  return null;
+}
+function maxCtx(m, n, cardGB, ramGB, head, off) {
+  let best = null;
+  for (const c of CTXS) { const w = placeOn(m, c, n, cardGB, ramGB, head, off); if (w) best = { c, w }; }
+  return best;
+}
+function maxSlots(m, c, cardGB, ramGB, head, off) {
+  let n = 0, w = null;
+  for (let k = 1; k <= 512; k++) { const p = placeOn(m, c, k, cardGB, ramGB, head, off); if (!p) break; n = k; w = p; }
+  return { n, w };
+}
+function tierOf(m) {
+  for (const t of TIERS) if (need(m, 8192, 1, "whole").card <= (t - 0.25) * 1024) return t;
+  return 24;
+}
+MODELS.forEach(m => { m.tier = tierOf(m); });
+MODELS.sort((a, b) => a.tier - b.tier || (b.q ?? -1) - (a.q ?? -1));
+const tierVar = t => `var(--t${Math.min(t, 16)})`;
+const fmtC = c => c >= 1048576 ? (c / 1048576) + "M" : (c / 1024) + "k";
+const gb = mib => (mib / 1024).toFixed(1);
+const PLACE = { whole: "whole on the card", experts: "experts in RAM", cpu: "on the CPU" };
+
+function seg(id, opts, key, fmt) {
+  const el = document.getElementById(id);
+  el.innerHTML = "";
+  for (const v of opts) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = fmt ? fmt(v) : v;
+    b.setAttribute("aria-pressed", String(S[key] === v));
+    b.onclick = () => { S[key] = v; save(); render(); };
+    el.appendChild(b);
+  }
+}
+function legend(id) {
+  document.getElementById(id).innerHTML = "VRAM tier, the smallest card that holds a model whole at 8k:&nbsp;" +
+    TIERS.map(t => `<span><span class="sw" style="background:${tierVar(t)}"></span>${t} GB</span>`).join("");
+}
+
+const tip = document.getElementById("tip");
+function showTip(e, html) { tip.innerHTML = html; tip.hidden = false; moveTip(e); }
+function moveTip(e) {
+  const r = tip.getBoundingClientRect();
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 14;
+  tip.style.left = Math.max(8, x) + "px"; tip.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+const slotsTxt = n => n >= 512 ? "512+" : n || '<span class="muted">0</span>';
+const speedOf = (m, w) => (m.speed || {})[w] || (w === "whole" ? "" : "speed not measured in this placement");
+
+function renderMenu() {
+  const f = FRAMES.find(x => x.id === S.frame) || FRAMES[0];
+  const rows = MODELS.map(m => {
+    const one = maxCtx(m, 1, f.card, f.ram, S.head, S.off);
+    const s4 = maxSlots(m, 4096, f.card, f.ram, S.head, S.off);
+    const s16 = maxSlots(m, 16384, f.card, f.ram, S.head, S.off);
+    return { m, one, s4, s16 };
+  });
+  const fitting = rows.filter(r => r.one && r.m.q != null);
+  const largest = fitting.slice().sort((a, b) => b.m.q - a.m.q || b.one.c - a.one.c)[0];
+  const widest = fitting.filter(r => r.m.q >= 0.7).sort((a, b) => b.s4.n - a.s4.n || b.m.q - a.m.q)[0];
+  const t = document.getElementById("menu");
+  t.innerHTML = `<thead><tr><th>model</th><th>quality</th><th>longest context, 1 slot</th><th>slots at 4k</th><th>slots at 16k</th><th>runs</th><th>card / RAM at 16k, 1 slot</th><th>measured speed</th></tr></thead>`;
+  const tb = document.createElement("tbody");
+  for (const r of rows) {
+    const { m, one } = r;
+    const tr = document.createElement("tr");
+    const isL = largest && r === largest, isW = widest && r === widest;
+    if (isL || isW) tr.className = "mark";
+    const w16 = placeOn(m, 16384, 1, f.card, f.ram, S.head, S.off);
+    const n16 = w16 ? need(m, 16384, 1, w16) : null;
+    const tags = (isL ? `<span class="tag pick">largest mind</span> ` : "") + (isW ? `<span class="tag pick">widest fan-out</span>` : "");
+    tr.innerHTML = `<td><span class="sw" style="background:${tierVar(m.tier)}"></span><span class="model">${m.short}</span><span class="tier">${m.tier} GB</span> ${tags}</td>
+      <td class="num">${m.q == null ? '<span class="muted">not measured</span>' : m.q.toFixed(3)}</td>
+      <td class="num">${one ? fmtC(one.c) + (one.c === m.train ? " (trained max)" : "") : '<span class="muted">does not fit</span>'}</td>
+      <td class="num">${slotsTxt(r.s4.n)}</td>
+      <td class="num">${slotsTxt(r.s16.n)}</td>
+      <td>${one ? `<span class="tag">${PLACE[one.w]}</span>` : ""}</td>
+      <td class="num">${n16 ? (n16.card ? gb(n16.card) + " / " : "— / ") + gb(n16.host) + " GB" : '<span class="muted">—</span>'}</td>
+      <td class="muted">${one ? speedOf(m, one.w) : ""}</td>`;
+    tb.appendChild(tr);
+  }
+  t.appendChild(tb);
+}
+
+function renderGrid() {
+  const g = document.getElementById("grid");
+  g.innerHTML = `<div class="gh">card</div>` + CTXS.map(c => `<div class="gh">${fmtC(c)} / slot</div>`).join("");
+  const rows = [...RUNGS].reverse().concat([0]);
+  for (const R of rows) {
+    const rh = document.createElement("div");
+    rh.className = "rh"; rh.innerHTML = R ? `${R} GB<small>card</small>` : `none<small>CPU only</small>`;
+    g.appendChild(rh);
+    for (const c of CTXS) {
+      const opts = [];
+      for (const m of MODELS) {
+        if (m.q == null) continue;
+        const w = placeOn(m, c, S.slots, R, S.ram, S.head, true);
+        if (w) opts.push({ m, w, x: need(m, c, S.slots, w) });
+      }
+      opts.sort((a, b) => b.m.q - a.m.q || (a.w === "whole" ? -1 : 1));
+      const cell = document.createElement("div");
+      cell.tabIndex = 0;
+      if (!opts.length) { cell.className = "cell empty"; cell.textContent = "nothing fits"; g.appendChild(cell); continue; }
+      const b = opts[0];
+      cell.className = "cell" + (b.w === "experts" ? " exp" : b.w === "cpu" ? " cpu" : "");
+      cell.style.background = `color-mix(in oklab, ${tierVar(b.m.tier)} 30%, var(--panel))`;
+      cell.innerHTML = `<span class="nm">${b.m.short}</span><span class="q">${b.m.q.toFixed(3)}</span><span class="gb">${b.x.card ? gb(b.x.card) + " card · " : ""}${gb(b.x.host)} RAM</span>`;
+      const html = `<b>${R ? R + " GB card" : "No card"} · ${S.ram} GB RAM · ${S.slots} × ${fmtC(c)}</b><br>` +
+        opts.slice(0, 6).map(o => `${o.m.short} ${o.m.q.toFixed(3)} — ${PLACE[o.w]}, ${o.x.card ? gb(o.x.card) + " GB card, " : ""}${gb(o.x.host)} GB RAM`).join("<br>") +
+        (speedOf(b.m, b.w) ? `<br><span style="opacity:.75">${b.m.short}: ${speedOf(b.m, b.w)}</span>` : "");
+      cell.onmousemove = e => showTip(e, html); cell.onmouseleave = hideTip;
+      cell.onfocus = () => { const r = cell.getBoundingClientRect(); showTip({ clientX: r.right, clientY: r.top }, html); };
+      cell.onblur = hideTip;
+      g.appendChild(cell);
+    }
+  }
+}
+
+function renderReach() {
+  const svg = document.getElementById("reach");
+  const W = 1080, L = 200, Rm = 70, rowH = 46, top = 34, maxGB = 24;
+  const rows = [];
+  for (const m of MODELS) { rows.push({ m, w: "whole" }); if (m.experts) rows.push({ m, w: "experts" }); }
+  const H = top + rows.length * rowH + 16;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.style.maxWidth = "none";
+  const x = g => L + (Math.min(g, maxGB) / maxGB) * (W - L - Rm);
+  let s = "";
+  for (const R of [0, ...RUNGS]) {
+    s += `<line class="${R ? "rung" : "axis"}" x1="${x(R)}" x2="${x(R)}" y1="${top - 8}" y2="${H - 10}"/>`;
+    s += `<text x="${x(R)}" y="${top - 14}" text-anchor="middle">${R} GB</text>`;
+  }
+  const marks = [4096, 16384, 65536, 131072];
+  rows.forEach((r, i) => {
+    const y = top + i * rowH + rowH / 2, m = r.m;
+    const pts = CTXS.filter(c => c <= m.train).map(c => ({ c, g: need(m, c, S.slots, r.w).card / 1024 }));
+    const col = tierVar(m.tier);
+    if (r.w === "whole") {
+      s += `<rect x="8" y="${y - 6}" width="10" height="10" rx="3" fill="${col}"/>`;
+      s += `<text class="lbl" x="26" y="${y + 3}">${m.short}</text>`;
+      s += `<text class="q" x="26" y="${y + 17}">${m.q == null ? "quality unmeasured" : "q " + m.q.toFixed(3)} · ${m.tier} GB tier</text>`;
+    } else {
+      s += `<text class="q" x="26" y="${y + 4}">${m.short}, experts in RAM (${gb(m.experts.hostMib + OV_PROC)} GB)</text>`;
+    }
+    const a = pts[0], z = pts[pts.length - 1];
+    s += `<line x1="${x(a.g)}" x2="${x(z.g)}" y1="${y}" y2="${y}" stroke="${col}" stroke-width="2" ${r.w === "experts" ? 'stroke-dasharray="5 4"' : ""} stroke-linecap="round"/>`;
+    for (const p of pts) {
+      const big = p === a || p === z || marks.includes(p.c);
+      if (!big) continue;
+      s += `<circle cx="${x(p.g)}" cy="${y}" r="5" fill="${r.w === "experts" ? "var(--panel)" : col}" stroke="${col}" stroke-width="2" data-t="${m.short} · ${PLACE[r.w]} · ${S.slots} × ${fmtC(p.c)}: ${p.g.toFixed(1)} GB card"><title>${m.short} ${fmtC(p.c)}: ${p.g.toFixed(1)} GB</title></circle>`;
+    }
+    s += `<text x="${x(a.g) - 8}" y="${y + 4}" text-anchor="end">${fmtC(a.c)}</text>`;
+    const zx = x(z.g);
+    s += `<text x="${zx + 9}" y="${y + 4}">${z.g > maxGB ? "→ " : ""}${fmtC(z.c)} ${z.g.toFixed(1)}</text>`;
+  });
+  svg.innerHTML = s;
+  svg.querySelectorAll("circle").forEach(c => { c.onmousemove = e => showTip(e, c.dataset.t); c.onmouseleave = hideTip; });
+  const t = document.getElementById("reachtable");
+  t.innerHTML = `<thead><tr><th>model</th><th>placement</th>${CTXS.map(c => `<th>${fmtC(c)}</th>`).join("")}</tr></thead><tbody>` +
+    rows.map(r => `<tr><td>${r.m.short}</td><td>${PLACE[r.w]}</td>${CTXS.map(c => `<td class="num">${c <= r.m.train ? gb(need(r.m, c, S.slots, r.w).card) : "—"}</td>`).join("")}</tr>`).join("") + "</tbody>";
+}
+
+function render() {
+  const sel = document.getElementById("frame");
+  if (!sel.options.length) {
+    for (const f of FRAMES) { const o = document.createElement("option"); o.value = f.id; o.textContent = f.label; sel.appendChild(o); }
+    sel.onchange = () => { S.frame = sel.value; save(); render(); };
+  }
+  sel.value = S.frame;
+  seg("head", [0.25, 0.5, 1], "head", v => v + " GB");
+  seg("off", [true, false], "off", v => v ? "allowed" : "card only");
+  seg("slots", [1, 2, 4, 8], "slots");
+  seg("ram", [8, 16, 32, 64], "ram", v => v + " GB");
+  legend("legend1");
+  renderMenu(); renderGrid(); renderReach();
+}
+render();
+</script>

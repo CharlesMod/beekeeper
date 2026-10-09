@@ -33,6 +33,14 @@ architecture, and RAM, then downloads an honest tier:
 | < 8 GB | same, tight-RAM profile | 2.5 GB | close heavy apps while it works |
 | optional: `bee setup --architect`, 16 GB+ GPU | Swift-Qwen3.8-27B IQ3_XS (dense 27B reasoning) | 13.0 GB | the "architect" tier; think with reasoning effort low for tool turns, medium for decisions |
 
+**What runs where:** [an interactive chart](https://htmlpreview.github.io/?https://github.com/CharlesMod/beekeeper/blob/master/docs/what-runs-where.html)
+of which models fit which machines (card VRAM, system RAM, context length,
+whole on the card or with a MoE's experts in RAM), built from the author's
+fleet measurements: pick your card and RAM and see what fits, how much
+context, and how fast. The file is [`docs/what-runs-where.html`](docs/what-runs-where.html)
+(self-contained; open it in any browser). Its Qwen3.8-27B row stands for Swift,
+which has the same architecture and is 0.1 GB smaller.
+
 Every download is checked against its published sha256 before it is used.
 Sampler settings for each model are written into `serve.sh`.
 
@@ -61,7 +69,9 @@ bee "task"               # another
 ```
 
 Apple Silicon with ≥12 GB can take the fast lane instead — a mixed-precision
-quant on an MLX server with prefix caching: `bee setup --mlx`.
+quant on an MLX server with prefix caching: `bee setup --mlx`. (That lane
+still serves the older Ling-3.0-tiny MLX quant: no MLX build of the new picks
+has been measured yet, so the llama.cpp lane above is the recommended one.)
 
 ## Daily use
 
