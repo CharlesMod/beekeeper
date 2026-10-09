@@ -28,16 +28,31 @@ architecture, and RAM, then downloads an honest tier:
 
 | your RAM | model it picks | download | notes |
 |---|---|---|---|
-| ≥ 12 GB | Ling-3.0-tiny IQ4_XS (8B MoE) | 4.4 GiB | the reference setup |
-| 8–12 GB | same, tight-RAM profile | 4.4 GiB | close heavy apps while it works |
-| < 8 GB | LFM2.5-2.6B Q4_K_M | 1.7 GiB | clean tool calling; suits small, single-step tasks |
+| ≥ 16 GB | Gemma-4-26B-A4B UD-IQ3_S (MoE, 4B active) | 11.3 GB | the reference setup; runs on any GPU from 4 GB up with its experts in system RAM |
+| 8 – under 16 GB | Qwen3.5-4B IQ4_XS | 2.5 GB | the default for small tasks; cheapest verified code solve we measured |
+| < 8 GB | same, tight-RAM profile | 2.5 GB | close heavy apps while it works |
+| optional: `bee setup --architect`, 16 GB+ GPU | Swift-Qwen3.8-27B IQ3_XS (dense 27B reasoning) | 13.0 GB | the "architect" tier; think with reasoning effort low for tool turns, medium for decisions |
 
-Honesty note, from our own benchmark: the < 8 GB tier runs the harness
-mechanics flawlessly (verified end-to-end), but on a multi-step repair
-benchmark it diagnoses without ever committing to an edit. Treat it as a
-capable runner of small, concrete tasks — "rename this", "add a flag",
-"summarize these logs" — not an autonomous repair agent. For that, use the
-≥ 12 GB tier or point `bee` at an API model (Lane 1).
+Every download is checked against its published sha256 before it is used.
+Sampler settings for each model are written into `serve.sh`.
+
+Measured in the author's fleet (not by this repo's tests): Qwen3.5-4B solves
+a code task for about 21 s each, the cheapest verified solve of the models
+tried, and scored 85% on the author's tool-call bench against 65% for the
+Ling-3.0-tiny this table used to pick, which lost on measurement. Gemma-4-26B-A4B
+decodes about 9.7 tok/s on CPU only, about 11 tok/s on a 4 GB laptop GPU and
+about 180 tok/s on a 16 GB card. LFM2.5-2.6B, the old sub-8 GB pick, fails the
+probe on the current llama.cpp build and was dropped. Swift-Qwen3.8-27B is a
+dense reasoning model tuned against overthinking; its base model's default effort
+(xhigh) overthinks badly, so set `BEEKEEPER_THINK=on`,
+`BEEKEEPER_EFFORT_EXPLORE=low` and `BEEKEEPER_EFFORT_DECIDE=medium`. Those
+two variables send `reasoning_effort` in `chat_template_kwargs` on thinking
+turns only, and nothing when unset.
+
+Honesty note: small models are capable runners of small, concrete tasks ("rename
+this", "add a flag", "summarize these logs") and weaker as autonomous
+multi-step repair agents. For hard repairs use the ≥ 16 GB tier or point `bee`
+at an API model (Lane 1).
 
 ```sh
 bee setup                # llama.cpp release binary + tiered model
@@ -72,6 +87,8 @@ lying about it, `2` = backend unreachable.
   deliberate, named act, on the record.
 - The advertised context window is a promise; beekeeper serves only what the
   hardware actually delivers.
+
+BeeKeeper is the coding bee of a family: the Hive (a self-managing cluster of home machines) and DBee, the Doctor Bee (https://github.com/CharlesMod/dbee), an autonomous on-call doctor for machines.
 
 MIT. One file each: `beekeeper.py` (the agent), `hatch.py` (setup),
 `waggle.py` (the phone board), `bee` (the front door).

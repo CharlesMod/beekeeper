@@ -197,3 +197,32 @@ def test_spend_is_logged(arena, monkeypatch, capsys):
     Budgeted(arena, [EDIT], overflow_on={1}).run()
     out = capsys.readouterr().out
     assert "budget=" in out and "closed=overflow" in out, out
+
+
+def _effort(body):
+    return (body.get("chat_template_kwargs") or {}).get("reasoning_effort", "absent")
+
+
+def test_reasoning_effort_is_off_unless_configured(arena, monkeypatch):
+    monkeypatch.setenv("BEEKEEPER_THINK", "on")
+    bk = Scripted(arena, [EDIT, RUN_VERIFY])
+    bk.run()
+    assert {_effort(b) for b in bk.bodies} == {"absent"}
+
+
+def test_reasoning_effort_light_to_explore_heavier_to_decide(arena, monkeypatch):
+    monkeypatch.setenv("BEEKEEPER_THINK", "on")
+    monkeypatch.setenv("BEEKEEPER_EFFORT_EXPLORE", "low")
+    monkeypatch.setenv("BEEKEEPER_EFFORT_DECIDE", "medium")
+    bk = Scripted(arena, [RUN_VERIFY, EDIT, RUN_VERIFY])
+    bk.run()
+    assert _effort(bk.bodies[0]) == "low"
+    assert "medium" in {_effort(b) for b in bk.bodies[1:]}
+
+
+def test_reasoning_effort_not_sent_when_not_thinking(arena, monkeypatch):
+    monkeypatch.setenv("BEEKEEPER_THINK", "off")
+    monkeypatch.setenv("BEEKEEPER_EFFORT_EXPLORE", "low")
+    bk = Scripted(arena, [EDIT])
+    bk.run()
+    assert {_effort(b) for b in bk.bodies} == {"absent"}
