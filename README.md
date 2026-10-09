@@ -5,7 +5,7 @@
 </picture>
 </p>
 
-A terse, honest coding agent harness in ~450 lines of stdlib Python.
+A terse, honest coding agent harness: one stdlib Python file (about 3,000 lines), no dependencies.
 It fixes code with the fewest causal moves — and **it cannot lie about
 being done**: completion is gated on your test suite's exit code plus a
 tamper monitor, never on the model's word.
