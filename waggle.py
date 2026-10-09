@@ -107,7 +107,7 @@ def board():
 <h1>🐝 <b>waggle</b></h1><div class="sub">dance a task at the hive · beekeeper runs it · one at a time</div>
 <form method="POST" action="/task">
 <label>task</label><textarea name="prompt" required placeholder="fix the failing tests in ..."></textarea>
-<label>arena directory</label><input type="text" name="arena" list="ar" required placeholder="/Users/cmod/Software/...">
+<label>arena directory</label><input type="text" name="arena" list="ar" required placeholder="/path/to/your/repo">
 <datalist id="ar">{opts}</datalist>
 <div class="row"><input type="checkbox" name="ungated" id="u"><label for="u" style="text-transform:none">ungated (skip verification — not recommended)</label></div>
 <button>⟶ hand it to the bee</button></form>
