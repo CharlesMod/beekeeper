@@ -33,6 +33,9 @@ architecture, and RAM, then downloads an honest tier:
 | < 8 GB | same, tight-RAM profile | 2.5 GB | close heavy apps while it works |
 | optional: `bee setup --architect`, 16 GB+ GPU | Swift-Qwen3.8-27B IQ3_XS (dense 27B reasoning) | 13.0 GB | the "architect" tier; think with reasoning effort low for tool turns, medium for decisions |
 
+<img width="1515" height="1205" alt="interactive chart" src="https://github.com/user-attachments/assets/2815835d-f512-4b9c-b3e8-00556c74fd3b" />
+
+
 **What runs where:** [an interactive chart](https://htmlpreview.github.io/?https://github.com/CharlesMod/beekeeper/blob/master/docs/what-runs-where.html)
 of which models fit which machines (card VRAM, system RAM, context length,
 whole on the card or with a MoE's experts in RAM), built from the author's
